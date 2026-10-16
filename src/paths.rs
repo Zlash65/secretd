@@ -40,6 +40,10 @@ pub fn default_runtime_path() -> Result<PathBuf, String> {
     Ok(app_data_directory()?.join("runtime.json"))
 }
 
+pub fn default_settings_path() -> Result<PathBuf, String> {
+    Ok(app_data_directory()?.join("settings.json"))
+}
+
 pub fn cli_runtime_path() -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("SECRET_D_RUNTIME") {
         return Ok(PathBuf::from(path));

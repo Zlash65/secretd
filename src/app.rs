@@ -5,23 +5,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _, Theme, ThemeRegistry,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT,
     TitleBar,
-    button::{Button, ButtonVariants as _},
-    group_box::{GroupBox, GroupBoxVariants as _},
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     radio::Radio,
     scroll::ScrollableElement as _,
-    tab::{Tab, TabBar},
+    spinner::Spinner,
     v_flex,
 };
 use gpui_kit::{
-    App, AppContext, Context, Entity, Focusable as _, Global, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, Styled, Subscription, Window, div,
-    prelude::FluentBuilder as _, px, rgb,
+    Anchor, App, AppContext, Context, ElementId, Entity, FocusHandle, Focusable as _, Global,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Role, SharedString,
+    StatefulInteractiveElement as _, Styled, Subscription, Window, div,
+    prelude::FluentBuilder as _, px, relative, rgb, rgba, transparent_black,
 };
 use tray_icon::{
     TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -30,7 +31,7 @@ use tray_icon::{
 use zeroize::Zeroizing;
 
 use secretd::{
-    aws::{AwsAccessLevel, AwsConfiguration, AwsLoginStatus, AwsTarget},
+    aws::{AwsAccessLevel, AwsConfiguration, AwsLoginStatus, AwsSettingsSummary, AwsTarget},
     controller::{
         AppSnapshot, ApprovalDecision, AuditAction, Controller, PendingAwsCredentialRequest,
         PendingRequest,
@@ -39,77 +40,21 @@ use secretd::{
     ipc::{RequestServer, begin_aws_login},
     paths::{default_runtime_path, default_vault_path},
     process::{ProcessIdentity, is_launchd_process, same_process},
+    settings::{Appearance, Page},
 };
 
 use crate::icon::{TrayStatus, tray_icon};
+use crate::preferences;
+use crate::theme::{self, Palette};
 
-const BACKGROUND: u32 = 0xe5e9ef;
-const SURFACE: u32 = 0xeff1f5;
-const SURFACE_MUTED: u32 = 0xdce0e8;
-const INK: u32 = 0x4c4f69;
-const MUTED: u32 = 0x7c7f93;
-const LINE: u32 = 0xccd0da;
-const GREEN: u32 = 0x5aa93b;
-const GREEN_SOFT: u32 = 0xe1eadc;
-const AMBER: u32 = 0xdf8e1d;
-const RED: u32 = 0xd26a53;
-const RED_SOFT: u32 = 0xf2d9d4;
+const APPEARANCES: [(Appearance, &str); 3] = [
+    (Appearance::System, "System"),
+    (Appearance::Light, "Light"),
+    (Appearance::Dark, "Dark"),
+];
 
-const CATPPUCCIN_LATTE_THEME: &str = r##"
-{
-  "name": "Catppuccin",
-  "author": "Catppuccino",
-  "url": "https://github.com/catppuccin/catppuccin",
-  "themes": [
-    {
-      "name": "Catppuccin Latte",
-      "mode": "light",
-      "colors": {
-        "accent.background": "#d3d8e0",
-        "accent.foreground": "#4c4f69",
-        "background": "#E5E9EF",
-        "border": "#CCD0DA",
-        "ring": "#7287fd",
-        "foreground": "#4c4f69",
-        "input.border": "#acb0be",
-        "link.active.foreground": "#7287fd",
-        "link.foreground": "#7287fd",
-        "link.hover.foreground": "#7287fd",
-        "list.active.background": "#7287fd22",
-        "list.active.border": "#7287fd",
-        "list.even.background": "#EFF1F5",
-        "list.head.background": "#dce0e8",
-        "muted.background": "#dce0e8",
-        "muted.foreground": "#9a9db2",
-        "panel.background": "#dce0e8",
-        "primary.active.background": "#7287fd",
-        "primary.background": "#7287fd",
-        "primary.foreground": "#EFF1F5",
-        "scrollbar.background": "#EFF1F500",
-        "scrollbar.thumb.background": "#acb0be",
-        "secondary.active.background": "#CCD2DE",
-        "secondary.background": "#dce0e8",
-        "secondary.foreground": "#4c4f69",
-        "secondary.hover.background": "#CCD2DE99",
-        "tab.active.background": "#E5E9EF",
-        "tab.active.foreground": "#4c4f69",
-        "tab.background": "#D2D7E200",
-        "tab.foreground": "#82848c",
-        "tab_bar.background": "#DCE0E8",
-        "title_bar.background": "#DCE0E8",
-        "title_bar.border": "#bec3d0",
-        "base.red": "#d26a53",
-        "base.green": "#5aa93b",
-        "base.yellow": "#df8e1d",
-        "base.blue": "#78acdc",
-        "base.magenta": "#8778dc",
-        "base.magenta.light": "#9978dc66",
-        "base.cyan": "#53d2b0"
-      }
-    }
-  ]
-}
-"##;
+const SIDEBAR_WIDTH: f32 = 216.;
+const CONTENT_MAX_WIDTH: f32 = 920.;
 
 #[derive(Clone, Copy, Debug)]
 pub enum AppEvent {
@@ -256,15 +201,6 @@ impl Drop for AppState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum View {
-    #[default]
-    Secrets,
-    Aws,
-    Grants,
-    Activity,
-}
-
 #[derive(Clone, Debug)]
 enum Modal {
     Secret { original_name: Option<String> },
@@ -291,8 +227,16 @@ struct Toast {
     expires_at: Instant,
 }
 
+/// The actions and body of a main-window page or an access request.
+struct PageContent {
+    actions: Option<gpui_kit::AnyElement>,
+    body: gpui_kit::AnyElement,
+}
+
 pub struct MainView {
-    view: View,
+    page: Page,
+    /// Tracks the current page's sidebar row, where focus goes when nothing has it.
+    nav_focus: FocusHandle,
     last_grant_process_check: Option<Instant>,
     auth_password: Entity<InputState>,
     auth_confirmation: Entity<InputState>,
@@ -324,12 +268,8 @@ impl MainView {
                 .placeholder("Enter it again")
                 .masked(true)
         });
-        if !Self::snapshot(cx).unlocked {
-            let focus_handle = auth_password.focus_handle(cx);
-            window.defer(cx, move |window, cx| {
-                focus_handle.focus(window, cx);
-            });
-        }
+        // Tab can't start from nothing, so focus a control once the window is drawn.
+        cx.defer_in(window, |this, window, cx| this.focus_default(window, cx));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search credentials…"));
         let _subscriptions = vec![
             cx.subscribe_in(&search, window, |_, _, event, _, cx| {
@@ -353,9 +293,13 @@ impl MainView {
                     this.submit_auth_form(window, cx);
                 }
             }),
+            // Unlocking, locking, closing a dialog, and revoking a grant remove the focused
+            // control. Focus another so Tab keeps working.
+            cx.on_focus_lost(window, |this, window, cx| this.focus_default(window, cx)),
         ];
         Self {
-            view: View::Secrets,
+            page: preferences::settings(cx).page,
+            nav_focus: cx.focus_handle(),
             last_grant_process_check: None,
             auth_password,
             auth_confirmation,
@@ -447,6 +391,18 @@ impl MainView {
         cx.notify();
     }
 
+    fn set_appearance(
+        &mut self,
+        appearance: Appearance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = theme::set_appearance(appearance, window, cx) {
+            self.toast(format!("Could not save appearance: {error}"), true, cx);
+        }
+        cx.notify();
+    }
+
     fn submit_auth(
         &mut self,
         _: &gpui_kit::ClickEvent,
@@ -489,16 +445,28 @@ impl MainView {
         cx.notify();
     }
 
-    fn switch_view(&mut self, view: View, cx: &mut Context<Self>) {
-        if view == View::Grants && self.view != View::Grants {
+    fn show_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        if page == Page::Grants && self.page != Page::Grants {
             self.last_grant_process_check = None;
         }
-        self.view = view;
+        self.page = page;
+        if let Err(error) = preferences::update(cx, |settings| settings.page = page) {
+            eprintln!("Could not save secretd settings: {error}");
+        }
         cx.notify();
     }
 
+    /// Focuses the current page's sidebar row, or the password field while locked.
+    fn focus_default(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if Self::snapshot(cx).unlocked {
+            self.nav_focus.focus(window, cx);
+        } else {
+            self.auth_password.focus_handle(cx).focus(window, cx);
+        }
+    }
+
     fn refresh_grant_liveness(&mut self, cx: &App) {
-        if self.view != View::Grants {
+        if self.page != Page::Grants {
             return;
         }
         let now = Instant::now();
@@ -515,7 +483,7 @@ impl MainView {
     }
 
     pub fn show_aws_login(&mut self, cx: &mut Context<Self>) {
-        self.switch_view(View::Aws, cx);
+        self.show_page(Page::Aws, cx);
     }
 
     fn open_secret(
@@ -862,143 +830,144 @@ impl MainView {
         cx.notify();
     }
 
-    fn render_auth(&self, creating: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_auth(
+        &self,
+        creating: bool,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         v_flex()
             .size_full()
             .items_center()
             .justify_center()
-            .bg(rgb(BACKGROUND))
+            .pb(TITLE_BAR_HEIGHT)
             .child(
                 v_flex()
-                    .w(px(460.))
-                    .gap_4()
-                    .p_8()
-                    .bg(rgb(SURFACE))
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded(px(20.))
-                    .child(brand())
+                    .w(px(340.))
+                    .gap_6()
                     .child(
                         v_flex()
-                            .gap_1()
+                            .items_center()
+                            .gap_2()
+                            .text_center()
+                            .child(icon_tile(
+                                IconName::LockKeyhole,
+                                56.,
+                                palette.accent,
+                                palette.accent_soft,
+                            ))
                             .child(
                                 div()
-                                    .text_size(px(26.))
+                                    .pt_2()
+                                    .text_size(px(20.))
                                     .font_semibold()
-                                    .text_color(rgb(INK))
                                     .child(if creating {
                                         "Create your vault"
                                     } else {
-                                        "Welcome back"
+                                        "secretd is locked"
                                     }),
                             )
-                            .child(div().text_color(rgb(MUTED)).child(if creating {
-                                "Protect credentials in an encrypted vault that stays on this Mac."
+                            .child(div().text_color(rgb(palette.muted)).child(if creating {
+                                "Choose a master password to encrypt your vault. It can't be recovered if you forget it."
                             } else {
-                                "Unlock your vault to manage credentials and approve access."
+                                "Enter your master password to unlock your vault."
                             })),
                     )
-                    .child(field(
-                        "Master password",
-                        Input::new(&self.auth_password).mask_toggle(),
-                    ))
-                    .when(creating, |this| {
-                        this.child(field(
-                            "Confirm password",
-                            Input::new(&self.auth_confirmation).mask_toggle(),
-                        ))
-                    })
-                    .when_some(self.auth_error.clone(), |this, error| {
-                        this.child(error_banner(error))
-                    })
                     .child(
-                        Button::new("submit-auth")
-                            .primary()
-                            .large()
-                            .w_full()
-                            .label(if creating {
-                                "Create encrypted vault"
-                            } else {
-                                "Unlock vault"
+                        v_flex()
+                            .gap_3()
+                            .child(
+                                Input::new(&self.auth_password)
+                                    .aria_label("Master password")
+                                    .large()
+                                    .mask_toggle(),
+                            )
+                            .when(creating, |this| {
+                                this.child(
+                                    Input::new(&self.auth_confirmation)
+                                        .aria_label("Confirm master password")
+                                        .large()
+                                        .mask_toggle(),
+                                )
                             })
-                            .on_click(cx.listener(Self::submit_auth)),
+                            .when_some(self.auth_error.clone(), |this, error| {
+                                this.child(error_banner(palette, error))
+                            })
+                            .child(
+                                Button::new("submit-auth")
+                                    .primary()
+                                    .large()
+                                    .w_full()
+                                    .label(if creating { "Create vault" } else { "Unlock" })
+                                    .on_click(cx.listener(Self::submit_auth)),
+                            ),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED))
+                            .text_size(px(12.))
+                            .text_color(rgb(palette.muted))
                             .text_center()
-                            .child("AES-256 encrypted • PBKDF2 protected"),
+                            .child("AES-256 encrypted · PBKDF2 protected"),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_header(
+    fn render_sidebar(
         &self,
         snapshot: &AppSnapshot,
+        palette: Palette,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let entity = cx.entity();
-        let active_count =
-            snapshot.grants.len() + snapshot.aws_grants.len() + snapshot.aws_denials.len();
-        let activity_count = snapshot.audit.len();
-        let badge_color = cx.theme().muted_foreground;
-        let selected_index = match self.view {
-            View::Secrets => 0,
-            View::Aws => 1,
-            View::Grants => 2,
-            View::Activity => 3,
+        let profiles = snapshot
+            .aws
+            .as_ref()
+            .map_or(0, |aws| aws.configuration.targets.len());
+        let grants = snapshot.grants.len() + snapshot.aws_grants.len() + snapshot.aws_denials.len();
+        let item = |page, icon, count| {
+            let active = self.page == page;
+            nav_item(page, icon, count, active, palette, entity.clone())
+                .when(active, |row| row.track_focus(&self.nav_focus))
         };
-        TitleBar::new()
+        v_flex()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .px_3()
+            .pt_1()
+            .pb_3()
+            .bg(rgb(palette.sidebar))
+            .border_r_1()
+            .border_color(rgb(palette.line))
+            .child(
+                // The pages announce themselves as tabs, like the tab bar they replaced.
+                v_flex()
+                    .id("pages")
+                    .role(Role::TabList)
+                    .child(nav_group(palette, "Vault"))
+                    .child(item(Page::Aws, IconName::Cloud, profiles))
+                    .child(item(
+                        Page::Credentials,
+                        IconName::KeyRound,
+                        snapshot.secrets.len(),
+                    ))
+                    .child(nav_group(palette, "Access"))
+                    .child(item(Page::Grants, IconName::ShieldCheck, grants))
+                    .child(item(Page::Activity, IconName::Activity, 0)),
+            )
+            .child(div().flex_1())
             .child(
                 h_flex()
-                    .w_full()
-                    .h_full()
-                    .pr_3()
-                    .gap_3()
-                    .items_center()
-                    .child(title_bar_brand())
-                    .child(status_pill("Vault unlocked", GREEN, GREEN_SOFT))
-                    .child(div().w(px(4.)))
+                    .gap_1()
                     .child(
-                        TabBar::new("main-navigation")
-                            .segmented()
-                            .small()
-                            .selected_index(selected_index)
-                            .on_click(move |index, _, cx| {
-                                let view = match index {
-                                    0 => View::Secrets,
-                                    1 => View::Aws,
-                                    2 => View::Grants,
-                                    _ => View::Activity,
-                                };
-                                entity.update(cx, |this, cx| this.switch_view(view, cx));
-                            })
-                            .child(Tab::new().label("Credentials"))
-                            .child(Tab::new().label("AWS SSO"))
-                            .child(counted_tab("Grants", active_count, badge_color))
-                            .child(counted_tab("Activity", activity_count, badge_color)),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("change-password")
-                            .ghost()
-                            .small()
-                            .label("Password")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_password(window, cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("lock")
-                            .outline()
-                            .small()
-                            .label("Lock")
+                        nav_row("lock-vault", IconName::Lock, "Lock vault", false, palette)
+                            .flex_1()
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.lock_vault(window, cx)),
                             ),
-                    ),
+                    )
+                    .child(settings_button(entity.clone())),
             )
             .into_any_element()
     }
@@ -1006,610 +975,611 @@ impl MainView {
     fn render_secrets(
         &self,
         snapshot: &AppSnapshot,
+        palette: Palette,
         cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
+    ) -> PageContent {
+        let new_secret = Button::new("new-secret")
+            .primary()
+            .icon(IconName::Plus)
+            .label("New credential")
+            .on_click(cx.listener(|this, _, window, cx| this.open_secret(None, window, cx)));
+        if snapshot.secrets.is_empty() {
+            return PageContent {
+                actions: None,
+                body: empty_state(
+                    palette,
+                    IconName::KeyRound,
+                    "No credentials yet",
+                    "Store API keys, tokens, and passwords. Processes ask for them with secretd get, and you approve each request.",
+                    Some(new_secret.into_any_element()),
+                ),
+            };
+        }
         let query = Self::input_value(&self.search, cx).to_ascii_lowercase();
         let visible: Vec<_> = snapshot
             .secrets
             .iter()
             .filter(|secret| query.is_empty() || secret.name.to_ascii_lowercase().contains(&query))
-            .cloned()
             .collect();
+        let mono = cx.theme().mono_font_family.clone();
         let entity = cx.entity();
-        v_flex()
-            .gap_4()
-            .child(section_header(
-                "Credentials",
-                "Manage encrypted credentials stored in your local vault.",
-            ))
+        let actions = h_flex()
+            // Lets the search box narrow in a narrow window.
+            .min_w_0()
+            .gap_2()
             .child(
-                h_flex()
-                    .gap_3()
-                    .child(div().w(px(320.)).child(Input::new(&self.search)))
-                    .child(div().flex_1())
-                    .child(
-                        Button::new("new-secret")
-                            .primary()
-                            .label("+ New credential")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_secret(None, window, cx)
-                            })),
-                    ),
+                div().w(px(220.)).min_w(px(120.)).child(
+                    Input::new(&self.search)
+                        .prefix(Icon::new(IconName::Search).text_color(rgb(palette.muted)))
+                        .cleanable(true),
+                ),
             )
-            .when(visible.is_empty(), |this| {
-                this.child(empty_state(if snapshot.secrets.is_empty() {
-                    "Your vault is empty"
-                } else {
-                    "No matching credentials"
-                }))
-            })
-            .children(visible.into_iter().map(|secret| {
-                let name = secret.name.clone();
-                let reveal_name = name.clone();
-                let edit_name = name.clone();
-                let delete_name = name.clone();
-                let revealed = self
-                    .revealed
-                    .as_ref()
-                    .filter(|(revealed, _)| revealed == &name)
-                    .map(|(_, value)| value.to_string());
-                card()
-                    .gap_3()
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .items_center()
-                            .child(credential_mark())
-                            .child(div().font_semibold().text_color(rgb(INK)).child(name))
-                            .child(div().flex_1())
+            .child(new_secret)
+            .into_any_element();
+        let body = if visible.is_empty() {
+            empty_state(
+                palette,
+                IconName::Search,
+                "No matching credentials",
+                "No credential name contains that text.",
+                None,
+            )
+        } else {
+            rows_panel(
+                palette,
+                visible
+                    .into_iter()
+                    .map(|secret| {
+                        let name = secret.name.clone();
+                        let revealed = self
+                            .revealed
+                            .as_ref()
+                            .filter(|(revealed, _)| revealed == &name)
+                            .map(|(_, value)| value.to_string());
+                        let (reveal_icon, reveal_label) = if revealed.is_some() {
+                            (IconName::EyeOff, "Hide value")
+                        } else {
+                            (IconName::Eye, "Reveal value")
+                        };
+                        let reveal_entity = entity.clone();
+                        let reveal_name = name.clone();
+                        let menu_entity = entity.clone();
+                        let menu_name = name.clone();
+                        list_row()
                             .child(
-                                Button::new(SharedString::from(format!("reveal-{reveal_name}")))
-                                    .outline()
-                                    .label(if revealed.is_some() { "Hide" } else { "Reveal" })
-                                    .on_click({
-                                        let entity = entity.clone();
-                                        move |_, _, cx| {
-                                            entity.update(cx, |this, cx| {
-                                                this.reveal_secret(reveal_name.clone(), cx)
-                                            });
-                                        }
+                                Icon::new(IconName::KeyRound)
+                                    .size(px(16.))
+                                    .text_color(rgb(palette.muted)),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .font_family(mono.clone())
+                                            .text_size(px(13.))
+                                            .truncate()
+                                            .child(name.clone()),
+                                    )
+                                    .when_some(revealed, |this, value| {
+                                        this.child(
+                                            div()
+                                                .px_2p5()
+                                                .py_1p5()
+                                                .rounded(px(6.))
+                                                .bg(rgb(palette.surface_muted))
+                                                .font_family(mono.clone())
+                                                .text_size(px(13.))
+                                                .child(value),
+                                        )
                                     }),
                             )
                             .child(
-                                Button::new(SharedString::from(format!("edit-{edit_name}")))
-                                    .outline()
-                                    .label("Edit")
-                                    .on_click({
-                                        let entity = entity.clone();
-                                        move |_, window, cx| {
-                                            entity.update(cx, |this, cx| {
-                                                this.open_secret(
-                                                    Some(edit_name.clone()),
-                                                    window,
-                                                    cx,
-                                                )
-                                            });
-                                        }
-                                    }),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!("delete-{delete_name}")))
-                                    .danger()
+                                Button::new(SharedString::from(format!("reveal-{name}")))
                                     .ghost()
-                                    .label("Delete")
-                                    .on_click({
-                                        let entity = entity.clone();
-                                        move |_, _, cx| {
-                                            entity.update(cx, |this, cx| {
-                                                this.modal =
-                                                    Some(Modal::Delete(delete_name.clone()));
-                                                cx.notify();
-                                            });
-                                        }
+                                    .icon(reveal_icon)
+                                    .tooltip(reveal_label)
+                                    .accessibility_label(format!("{reveal_label} of {name}"))
+                                    .on_click(move |_, _, cx| {
+                                        reveal_entity.update(cx, |this, cx| {
+                                            this.reveal_secret(reveal_name.clone(), cx)
+                                        });
                                     }),
-                            ),
-                    )
-                    .when_some(revealed, |this, value| {
-                        this.child(
-                            v_flex()
-                                .gap_1()
-                                .pt_2()
-                                .border_t_1()
-                                .border_color(rgb(LINE))
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .font_semibold()
-                                        .text_color(rgb(MUTED))
-                                        .child("SECRET VALUE"),
-                                )
-                                .child(
-                                    div()
-                                        .p_3()
-                                        .bg(rgb(SURFACE_MUTED))
-                                        .rounded(px(8.))
-                                        .font_family("monospace")
-                                        .child(value),
-                                ),
-                        )
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("more-{name}")))
+                                    .ghost()
+                                    .icon(IconName::Ellipsis)
+                                    .tooltip("More actions")
+                                    .accessibility_label(format!("More actions for {name}"))
+                                    .dropdown_menu_with_anchor(
+                                        Anchor::TopRight,
+                                        move |menu, _, _| {
+                                            let edit_entity = menu_entity.clone();
+                                            let edit_name = menu_name.clone();
+                                            let delete_entity = menu_entity.clone();
+                                            let delete_name = menu_name.clone();
+                                            menu.item(
+                                                PopupMenuItem::new("Edit…")
+                                                    .icon(IconName::Pencil)
+                                                    .on_click(move |_, window, cx| {
+                                                        edit_entity.update(cx, |this, cx| {
+                                                            this.open_secret(
+                                                                Some(edit_name.clone()),
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        });
+                                                    }),
+                                            )
+                                            .item(
+                                                PopupMenuItem::new("Delete…")
+                                                    .icon(IconName::Trash)
+                                                    .on_click(move |_, _, cx| {
+                                                        delete_entity.update(cx, |this, cx| {
+                                                            this.modal = Some(Modal::Delete(
+                                                                delete_name.clone(),
+                                                            ));
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                            )
+                                        },
+                                    ),
+                            )
                     })
-            }))
+                    .collect(),
+            )
             .into_any_element()
+        };
+        PageContent {
+            actions: Some(actions),
+            body,
+        }
     }
 
-    fn render_aws(&self, snapshot: &AppSnapshot, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_aws(
+        &self,
+        snapshot: &AppSnapshot,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> PageContent {
         let login_in_progress = matches!(
             snapshot.aws_login,
             AwsLoginStatus::Starting
                 | AwsLoginStatus::AwaitingUser(_)
                 | AwsLoginStatus::Discovering
         );
-        let has_connection = snapshot.aws.is_some();
-        let has_discovered_accounts = snapshot
-            .aws
-            .as_ref()
-            .is_some_and(|aws| !aws.discovered_accounts.is_empty());
+        let mono = cx.theme().mono_font_family.clone();
+        let banner = aws_login_banner(&snapshot.aws_login, palette);
+        let Some(aws) = &snapshot.aws else {
+            return PageContent {
+                actions: None,
+                body: v_flex()
+                    .flex_1()
+                    .gap_6()
+                    .children(banner)
+                    .child(empty_state(
+                        palette,
+                        IconName::Cloud,
+                        "Connect AWS IAM Identity Center",
+                        "Sign in through your AWS access portal. secretd then issues short-lived role credentials to the processes you approve.",
+                        Some(
+                            Button::new("connect-aws")
+                                .primary()
+                                .label("Connect AWS")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_aws_connection(window, cx)
+                                }))
+                                .into_any_element(),
+                        ),
+                    ))
+                    .into_any_element(),
+            };
+        };
         let entity = cx.entity();
-        let configure_entity = entity.clone();
+        let has_discovered_accounts = !aws.discovered_accounts.is_empty();
         let actions = h_flex()
-            .gap_2()
-            .when(has_connection, |this| {
-                this.child(
-                    Button::new("refresh-aws")
-                        .primary()
-                        .small()
-                        .label(if login_in_progress {
-                            "Working…"
-                        } else {
-                            "Refresh"
+            .gap_1()
+            .child(
+                Button::new("refresh-aws")
+                    .outline()
+                    .icon(IconName::RefreshCw)
+                    .label(if login_in_progress {
+                        "Signing in…"
+                    } else if aws.logged_in {
+                        "Refresh"
+                    } else {
+                        "Sign in"
+                    })
+                    .loading(login_in_progress)
+                    .on_click(cx.listener(|this, _, _, cx| this.begin_aws_refresh(cx))),
+            )
+            .child(
+                Button::new("configure-aws")
+                    .ghost()
+                    .icon(IconName::Ellipsis)
+                    .tooltip("More actions")
+                    .accessibility_label("More AWS SSO actions")
+                    .disabled(login_in_progress)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let aliases_entity = entity.clone();
+                        let connection_entity = entity.clone();
+                        menu.when(has_discovered_accounts, |menu| {
+                            menu.item(PopupMenuItem::new("Edit profile aliases…").on_click(
+                                move |_, window, cx| {
+                                    aliases_entity
+                                        .update(cx, |this, cx| this.open_aws_aliases(window, cx));
+                                },
+                            ))
                         })
+                        .item(
+                            PopupMenuItem::new("Change SSO connection…").on_click(
+                                move |_, window, cx| {
+                                    connection_entity.update(cx, |this, cx| {
+                                        this.open_aws_connection(window, cx)
+                                    });
+                                },
+                            ),
+                        )
+                    }),
+            )
+            .into_any_element();
+        let session = if aws.logged_in {
+            let detail = aws
+                .access_token_expires_at
+                .filter(|expires_at| *expires_at > secretd::aws::now_seconds())
+                .map(|expires_at| {
+                    format!(
+                        "token renews automatically ({} remaining)",
+                        duration_until_seconds(expires_at)
+                    )
+                });
+            status_label(palette, palette.green, "Signed in", detail)
+        } else {
+            status_label(
+                palette,
+                palette.amber,
+                "Signed out",
+                Some("sign in to request credentials".into()),
+            )
+        };
+        let connection = section(
+            palette,
+            "Connection",
+            None,
+            rows_panel(
+                palette,
+                vec![
+                    detail_row(
+                        palette,
+                        "Access portal",
+                        div().truncate().child(aws.configuration.start_url.clone()),
+                    ),
+                    detail_row(
+                        palette,
+                        "Region",
+                        div().child(aws.configuration.sso_region.clone()),
+                    ),
+                    detail_row(palette, "Session", session),
+                ],
+            ),
+        );
+        PageContent {
+            actions: Some(actions),
+            body: v_flex()
+                .gap_7()
+                .children(banner)
+                .child(connection)
+                .child(self.render_aws_profiles(
+                    aws,
+                    snapshot,
+                    login_in_progress,
+                    palette,
+                    mono,
+                    cx,
+                ))
+                .into_any_element(),
+        }
+    }
+
+    fn render_aws_profiles(
+        &self,
+        aws: &AwsSettingsSummary,
+        snapshot: &AppSnapshot,
+        login_in_progress: bool,
+        palette: Palette,
+        mono: SharedString,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let message = |text: String, action: Option<gpui_kit::AnyElement>| {
+            section(
+                palette,
+                "Profiles",
+                None,
+                panel(palette).child(panel_message(palette, text, action)),
+            )
+        };
+        if !aws.discovery_complete {
+            return message(
+                "Sign in to discover the AWS accounts and roles assigned to you.".into(),
+                None,
+            );
+        }
+        if aws.discovered_accounts.is_empty() {
+            return message(
+                "AWS returned no accounts assigned to this identity.".into(),
+                None,
+            );
+        }
+        if aws.configuration.targets.is_empty() {
+            return message(
+                "Choose a local profile name for each AWS account assigned to you.".into(),
+                Some(
+                    Button::new("assign-aliases")
+                        .primary()
+                        .label("Assign profile aliases")
                         .disabled(login_in_progress)
-                        .on_click(cx.listener(|this, _, _, cx| this.begin_aws_refresh(cx))),
-                )
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_aws_aliases(window, cx)),
+                        )
+                        .into_any_element(),
+                ),
+            );
+        }
+        let edit = Button::new("edit-aliases")
+            .ghost()
+            .small()
+            .label("Edit aliases")
+            .disabled(login_in_progress)
+            .on_click(cx.listener(|this, _, window, cx| this.open_aws_aliases(window, cx)))
+            .into_any_element();
+        let header = list_row()
+            .min_h(px(36.))
+            .gap_4()
+            .text_size(px(12.))
+            .font_medium()
+            .text_color(rgb(palette.muted))
+            .child(div().w(relative(0.2)).child("Profile"))
+            .child(div().flex_1().child("Account"))
+            .child(div().w(relative(0.24)).child("Read-only role"))
+            .child(div().w(relative(0.24)).child("Admin role"));
+        let rows = aws.configuration.targets.iter().map(|target| {
+            let account = aws
+                .discovered_accounts
+                .iter()
+                .find(|account| account.account_id == target.account_id);
+            let active = snapshot
+                .aws_grants
+                .iter()
+                .any(|grant| grant.profile == target.profile);
+            list_row()
+                .gap_4()
                 .child(
-                    Button::new("configure-aws")
-                        .outline()
-                        .small()
-                        .label("Configure")
-                        .disabled(login_in_progress)
-                        .dropdown_menu(move |menu, _, _| {
-                            let aliases_entity = configure_entity.clone();
-                            let connection_entity = configure_entity.clone();
-                            menu.when(has_discovered_accounts, |this| {
-                                this.item(PopupMenuItem::new("Profile aliases").on_click(
-                                    move |_, window, cx| {
-                                        aliases_entity.update(cx, |this, cx| {
-                                            this.open_aws_aliases(window, cx)
-                                        });
-                                    },
-                                ))
-                            })
-                            .item(
-                                PopupMenuItem::new("SSO connection").on_click(
-                                    move |_, window, cx| {
-                                        connection_entity.update(cx, |this, cx| {
-                                            this.open_aws_connection(window, cx)
-                                        });
-                                    },
-                                ),
-                            )
+                    h_flex()
+                        .w(relative(0.2))
+                        .min_w_0()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .font_family(mono.clone())
+                                .text_size(px(13.))
+                                .font_semibold()
+                                .truncate()
+                                .child(target.profile.clone()),
+                        )
+                        .when(active, |this| {
+                            this.child(tag("Active", palette.green, palette.green_soft))
                         }),
                 )
-            })
-            .when(!has_connection, |this| {
-                this.child(
-                    Button::new("edit-aws-connection")
-                        .primary()
-                        .small()
-                        .label("Connect AWS")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_aws_connection(window, cx)),
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().truncate().child(account.map_or_else(
+                            || target.account_id.clone(),
+                            |account| account.account_name.clone(),
+                        )))
+                        .child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_size(px(12.))
+                                .text_color(rgb(palette.muted))
+                                .child(target.account_id.clone()),
                         ),
                 )
-            });
-        let mut content = v_flex().gap_4().child(
-            h_flex()
-                .items_start()
-                .child(section_header(
-                    "AWS profiles",
-                    "IAM Identity Center accounts and role mappings.",
-                ))
-                .child(div().flex_1())
-                .child(actions),
-        );
-        content = match &snapshot.aws_login {
-            AwsLoginStatus::Starting => {
-                content.child(status_pill("Checking AWS session…", AMBER, SURFACE_MUTED))
-            }
-            AwsLoginStatus::AwaitingUser(authorization) => {
-                let url = authorization.url.clone();
-                content.child(
-                    card()
-                        .bg(rgb(GREEN_SOFT))
-                        .child(
-                            div()
-                                .font_semibold()
-                                .child("Complete sign-in in your browser"),
-                        )
-                        .child(
-                            div().child("Sign in or approve access in the browser on this computer. secretd will continue automatically."),
-                        )
-                        .child(
-                            Button::new("open-aws-login")
-                                .primary()
-                                .label("Open AWS sign-in")
-                                .on_click(move |_, _, cx| cx.open_url(&url)),
-                        )
-                        .child(div().text_color(rgb(MUTED)).child(format!(
-                            "This request expires in {}",
-                            duration_until_seconds(authorization.expires_at)
-                        ))),
+                .child(
+                    div()
+                        .w(relative(0.24))
+                        .text_size(px(13.))
+                        .truncate()
+                        .child(target.read_only_role.clone()),
                 )
-            }
-            AwsLoginStatus::Discovering => content.child(status_pill(
-                "Loading AWS accounts and roles…",
-                AMBER,
-                SURFACE_MUTED,
-            )),
-            AwsLoginStatus::LoggedIn { expires_at } => content.child(status_pill(
-                &format!(
-                    "Signed in · token renews automatically ({} remaining)",
-                    duration_until_seconds(*expires_at)
-                ),
-                GREEN,
-                GREEN_SOFT,
-            )),
-            AwsLoginStatus::Failed(error) => content.child(error_banner(error.clone())),
-            AwsLoginStatus::Idle => content,
-        };
-        let Some(aws) = &snapshot.aws else {
-            return content
-                .child(empty_state(
-                    "Step 1 · Enter your AWS access portal URL to begin",
-                ))
-                .into_any_element();
-        };
-        content
-            .child(
-                GroupBox::new()
-                    .id("aws-connection")
-                    .outline()
-                    .title(div().font_semibold().child("SSO connection"))
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .items_center()
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .font_semibold()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .child(aws.configuration.start_url.clone()),
-                                    )
-                                    .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(
-                                        format!("Region · {}", aws.configuration.sso_region),
-                                    )),
-                            )
-                            .child(status_pill(
-                                if aws.logged_in {
-                                    "Available"
-                                } else {
-                                    "Sign in"
-                                },
-                                if aws.logged_in { GREEN } else { AMBER },
-                                SURFACE_MUTED,
-                            )),
-                    ),
-            )
-            .when(!aws.discovery_complete, |this| {
-                this.child(empty_state(
-                    "Step 2 · Sign in to discover your AWS accounts",
-                ))
-            })
-            .when(
-                aws.discovery_complete && aws.discovered_accounts.is_empty(),
-                |this| {
-                    this.child(empty_state(
-                        "AWS returned no accounts assigned to this identity",
-                    ))
-                },
-            )
-            .when(!aws.configuration.targets.is_empty(), |this| {
-                this.child(
-                    v_flex()
-                        .gap_3()
-                        .child(
-                            div()
-                                .text_size(px(18.))
-                                .font_semibold()
-                                .child("Configured profiles"),
-                        )
-                        .children(aws.configuration.targets.iter().map(|target| {
-                            GroupBox::new()
-                                .id(SharedString::from(format!(
-                                    "aws-profile-{}",
-                                    target.profile
-                                )))
-                                .outline()
-                                .child(
-                                    h_flex()
-                                        .gap_3()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                                .size(px(36.))
-                                                .flex_shrink_0()
-                                                .rounded(px(10.))
-                                                .bg(rgb(SURFACE_MUTED))
-                                                .text_color(rgb(INK))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_size(px(11.))
-                                                .font_semibold()
-                                                .child("AWS"),
-                                        )
-                                        .child(
-                                            v_flex()
-                                                .min_w_0()
-                                                .flex_1()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .font_semibold()
-                                                        .font_family("monospace")
-                                                        .child(target.profile.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(12.))
-                                                        .text_color(rgb(MUTED))
-                                                        .child(format!(
-                                                            "Account {}",
-                                                            target.account_id
-                                                        )),
-                                                ),
-                                        )
-                                        .child(
-                                            v_flex()
-                                                .flex_shrink_0()
-                                                .items_end()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(12.))
-                                                        .child(target.read_only_role.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(12.))
-                                                        .text_color(rgb(MUTED))
-                                                        .child(target.admin_role.clone()),
-                                                ),
-                                        ),
-                                )
-                        })),
+                .child(
+                    div()
+                        .w(relative(0.24))
+                        .text_size(px(13.))
+                        .truncate()
+                        .child(target.admin_role.clone()),
                 )
-            })
-            .when(
-                aws.discovery_complete
-                    && !aws.discovered_accounts.is_empty()
-                    && aws.configuration.targets.is_empty(),
-                |this| {
-                    this.child(
-                        Button::new("assign-aliases")
-                            .primary()
-                            .label("Assign profile aliases")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_aws_aliases(window, cx)
-                                }),
-                            ),
-                    )
-                },
-            )
-            .into_any_element()
+        });
+        section(
+            palette,
+            "Profiles",
+            Some(edit),
+            rows_panel(palette, std::iter::once(header).chain(rows).collect()),
+        )
     }
 
     fn render_grants(
         &self,
         snapshot: &AppSnapshot,
+        palette: Palette,
         cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
+    ) -> PageContent {
+        if snapshot.grants.is_empty()
+            && snapshot.aws_grants.is_empty()
+            && snapshot.aws_denials.is_empty()
+        {
+            return PageContent {
+                actions: None,
+                body: empty_state(
+                    palette,
+                    IconName::ShieldCheck,
+                    "No active grants",
+                    "When you grant a process access for 30 minutes, it appears here so you can extend or revoke it.",
+                    None,
+                ),
+            };
+        }
         let entity = cx.entity();
-        v_flex()
-            .gap_4()
-            .child(section_header(
-                "Grants",
-                "Manage temporary access grants and remembered denials.",
-            ))
-            .when(!snapshot.aws_grants.is_empty(), |this| {
-                this.child(
+        let mono = cx.theme().mono_font_family.clone();
+        let mut active = Vec::new();
+        for grant in &snapshot.aws_grants {
+            active.push(
+                grant_row(
+                    palette,
+                    IconName::Cloud,
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .font_family(mono.clone())
+                                .text_size(px(13.))
+                                .font_semibold()
+                                .truncate()
+                                .child(grant.profile.clone()),
+                        )
+                        .child(level_button(
+                            grant.id.clone(),
+                            &grant.profile,
+                            grant.level,
+                            palette,
+                            entity.clone(),
+                            cx,
+                        )),
+                    &grant.process,
+                    format!("{} left", duration_until(grant.expires_at)),
+                )
+                .child(action_button(
+                    grant.id.clone(),
+                    &grant.profile,
+                    true,
+                    true,
+                    entity.clone(),
+                ))
+                .child(action_button(
+                    grant.id.clone(),
+                    &grant.profile,
+                    false,
+                    true,
+                    entity.clone(),
+                )),
+            );
+        }
+        for grant in &snapshot.grants {
+            active.push(
+                grant_row(
+                    palette,
+                    IconName::KeyRound,
                     div()
-                        .text_color(rgb(MUTED))
-                        .text_sm()
-                        .child("Access changes apply to future credential requests. Issued AWS credentials remain valid until they expire."),
+                        .font_family(mono.clone())
+                        .text_size(px(13.))
+                        .font_semibold()
+                        .truncate()
+                        .child(grant.resource.clone()),
+                    &grant.process,
+                    format!("{} left", duration_until(grant.expires_at)),
                 )
-            })
-            .when(
-                snapshot.grants.is_empty()
-                    && snapshot.aws_grants.is_empty()
-                    && snapshot.aws_denials.is_empty(),
-                |this| this.child(empty_state("No active grants or blocks")),
-            )
-            .children(snapshot.aws_grants.iter().map(|grant| {
-                let revoke_id = grant.id.clone();
-                let extend_id = grant.id.clone();
-                let change_id = grant.id.clone();
-                let change_entity = entity.clone();
-                let (level, label) = match grant.level {
-                    AwsAccessLevel::ReadOnly => (AwsAccessLevel::Admin, "Switch to admin"),
-                    AwsAccessLevel::Admin => (AwsAccessLevel::ReadOnly, "Switch to read-only"),
-                };
-                card().child(
-                    h_flex()
-                        .gap_3()
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .font_semibold()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .child(format!(
-                                            "AWS {} · {} credentials",
-                                            grant.profile,
-                                            grant.level.label()
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(rgb(MUTED))
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .child(format!(
-                                            "{} · PID {} · expires in {}",
-                                            compact_process_label(&grant.process),
-                                            grant.process.pid,
-                                            duration_until(grant.expires_at)
-                                        )),
-                                ),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("access-{change_id}")))
-                                .flex_shrink_0()
-                                .outline()
-                                .label(label)
-                                .on_click(move |_, _, cx| {
-                                    change_entity.update(cx, |this, cx| {
-                                        this.set_aws_grant_level(change_id.clone(), level, cx)
-                                    });
-                                }),
-                        )
-                        .child(action_button(
-                            "Extend",
-                            extend_id,
-                            true,
-                            true,
-                            entity.clone(),
-                        ))
-                        .child(action_button(
-                            "Revoke",
-                            revoke_id,
-                            false,
-                            true,
-                            entity.clone(),
-                        )),
-                )
-            }))
-            .children(snapshot.grants.iter().map(|grant| {
-                let revoke_id = grant.id.clone();
-                let extend_id = grant.id.clone();
-                card().child(
-                    h_flex()
-                        .gap_3()
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .font_semibold()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .child(grant.resource.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(rgb(MUTED))
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .child(format!(
-                                            "{} · PID {} · expires in {}",
-                                            compact_process_label(&grant.process),
-                                            grant.process.pid,
-                                            duration_until(grant.expires_at)
-                                        )),
-                                ),
-                        )
-                        .child(action_button(
-                            "Extend",
-                            extend_id,
-                            true,
-                            false,
-                            entity.clone(),
-                        ))
-                        .child(action_button(
-                            "Revoke",
-                            revoke_id,
-                            false,
-                            false,
-                            entity.clone(),
-                        )),
-                )
-            }))
-            .children(snapshot.aws_denials.iter().map(|denial| {
+                .child(action_button(
+                    grant.id.clone(),
+                    &grant.resource,
+                    true,
+                    false,
+                    entity.clone(),
+                ))
+                .child(action_button(
+                    grant.id.clone(),
+                    &grant.resource,
+                    false,
+                    false,
+                    entity.clone(),
+                )),
+            );
+        }
+        let blocked: Vec<_> = snapshot
+            .aws_denials
+            .iter()
+            .map(|denial| {
                 let denial_id = denial.id.clone();
                 let entity = entity.clone();
-                card().child(
-                    h_flex()
-                        .gap_3()
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .font_semibold()
-                                        .text_color(rgb(RED))
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .child(format!("Blocked · AWS {}", denial.profile)),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(rgb(MUTED))
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .child(format!(
-                                            "{} · PID {} · expires in {}",
-                                            compact_process_label(&denial.process),
-                                            denial.process.pid,
-                                            duration_until(denial.expires_at)
-                                        )),
-                                ),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("unblock-{denial_id}")))
-                                .flex_shrink_0()
-                                .outline()
-                                .label("Unblock")
-                                .on_click(move |_, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        this.unblock_aws_denial(denial_id.clone(), cx)
-                                    });
-                                }),
-                        ),
+                grant_row(
+                    palette,
+                    IconName::Ban,
+                    div()
+                        .font_family(mono.clone())
+                        .text_size(px(13.))
+                        .font_semibold()
+                        .truncate()
+                        .child(denial.profile.clone()),
+                    &denial.process,
+                    format!("unblocks in {}", duration_until(denial.expires_at)),
                 )
-            }))
-            .into_any_element()
+                .child(
+                    Button::new(SharedString::from(format!("unblock-{denial_id}")))
+                        .flex_shrink_0()
+                        .outline()
+                        .label("Unblock")
+                        .accessibility_label(format!("Unblock {}", denial.profile))
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.unblock_aws_denial(denial_id.clone(), cx)
+                            });
+                        }),
+                )
+            })
+            .collect();
+        let has_aws_grants = !snapshot.aws_grants.is_empty();
+        PageContent {
+            actions: None,
+            body: v_flex()
+                .gap_7()
+                .when(!active.is_empty(), |this| {
+                    this.child(section(
+                        palette,
+                        "Active access",
+                        None,
+                        v_flex()
+                            .gap_2()
+                            .child(rows_panel(palette, active))
+                            .when(has_aws_grants, |this| {
+                                this.child(footnote(
+                                    palette,
+                                    "Switching access applies to future credential requests. AWS credentials already issued stay valid until they expire.",
+                                ))
+                            }),
+                    ))
+                })
+                .when(!blocked.is_empty(), |this| {
+                    this.child(section(
+                        palette,
+                        "Blocked requests",
+                        None,
+                        v_flex()
+                            .gap_2()
+                            .child(rows_panel(palette, blocked))
+                            .child(footnote(
+                                palette,
+                                "secretd won't ask about a denied process again for 30 minutes. Unblock it to be asked on its next request.",
+                            )),
+                    ))
+                })
+                .into_any_element(),
+        }
     }
 
     fn unblock_aws_denial(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1656,51 +1626,93 @@ impl MainView {
         cx.notify();
     }
 
-    fn render_activity(&self, snapshot: &AppSnapshot) -> gpui_kit::AnyElement {
-        v_flex()
-            .gap_4()
-            .child(section_header(
-                "Activity",
-                "A memory-only record that is cleared when secretd exits.",
-            ))
-            .when(snapshot.audit.is_empty(), |this| {
-                this.child(empty_state("No activity yet"))
-            })
-            .children(snapshot.audit.iter().map(|entry| {
-                card()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .gap_3()
+    fn render_activity(&self, snapshot: &AppSnapshot, palette: Palette, cx: &App) -> PageContent {
+        if snapshot.audit.is_empty() {
+            return PageContent {
+                actions: None,
+                body: empty_state(
+                    palette,
+                    IconName::Activity,
+                    "No activity yet",
+                    "Requests, approvals, and revocations appear here while secretd is running.",
+                    None,
+                ),
+            };
+        }
+        let mono = cx.theme().mono_font_family.clone();
+        PageContent {
+            actions: Some(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(palette.muted))
+                    .child("Cleared when secretd quits")
+                    .into_any_element(),
+            ),
+            body: rows_panel(
+                palette,
+                snapshot
+                    .audit
+                    .iter()
+                    .map(|entry| {
+                        list_row()
+                            .min_h(px(44.))
+                            .child(status_dot(match entry.action {
+                                AuditAction::Denied
+                                | AuditAction::TimedOut
+                                | AuditAction::Revoked => palette.red,
+                                _ => palette.green,
+                            }))
                             .child(
                                 div()
-                                    .font_semibold()
-                                    .text_color(rgb(match entry.action {
-                                        AuditAction::Denied
-                                        | AuditAction::TimedOut
-                                        | AuditAction::Revoked => RED,
-                                        _ => GREEN,
-                                    }))
+                                    .w(px(170.))
+                                    .min_w_0()
+                                    .truncate()
                                     .child(audit_label(entry.action)),
                             )
-                            .child(div().font_family("monospace").child(entry.secret.clone()))
-                            .child(div().flex_1())
                             .child(
                                 div()
-                                    .text_color(rgb(MUTED))
+                                    .w(px(180.))
+                                    .min_w_0()
+                                    .font_family(mono.clone())
+                                    .text_size(px(13.))
+                                    .truncate()
+                                    .child(entry.secret.clone()),
+                            )
+                            .child(
+                                // In a narrow window the two columns before this one give way first.
+                                div()
+                                    .flex_1()
+                                    .min_w(px(120.))
+                                    .text_size(px(13.))
+                                    .text_color(rgb(palette.muted))
+                                    .truncate()
+                                    .child(format!(
+                                        "{} · PID {}",
+                                        compact_process_label(&entry.process),
+                                        entry.process.pid
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(palette.muted))
                                     .child(duration_since(entry.occurred_at)),
-                            ),
-                    )
-                    .child(div().text_color(rgb(MUTED)).child(format!(
-                        "{} · PID {}",
-                        compact_process_label(&entry.process),
-                        entry.process.pid
-                    )))
-            }))
-            .into_any_element()
+                            )
+                    })
+                    .collect(),
+            )
+            .into_any_element(),
+        }
     }
 
-    fn render_modal(&self, modal: &Modal, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_modal(
+        &self,
+        modal: &Modal,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let mono = cx.theme().mono_font_family.clone();
         let body = match modal {
             Modal::Secret { original_name } => v_flex()
                 .gap_4()
@@ -1709,13 +1721,20 @@ impl MainView {
                 } else {
                     "New credential"
                 }))
-                .child(field("Name", Input::new(&self.secret_name)))
                 .child(field(
+                    palette,
+                    "Name",
+                    Input::new(&self.secret_name).aria_label("Name"),
+                ))
+                .child(field(
+                    palette,
                     "Value",
-                    Textarea::new(&self.secret_value).h(px(150.)),
+                    Textarea::new(&self.secret_value)
+                        .aria_label("Value")
+                        .h(px(150.)),
                 ))
                 .when_some(self.form_error.clone(), |this, error| {
-                    this.child(error_banner(error))
+                    this.child(error_banner(palette, error))
                 })
                 .child(modal_actions(
                     "Save credential",
@@ -1727,15 +1746,21 @@ impl MainView {
                 .gap_4()
                 .child(modal_title("Change master password"))
                 .child(field(
+                    palette,
                     "New password",
-                    Input::new(&self.new_password).mask_toggle(),
+                    Input::new(&self.new_password)
+                        .aria_label("New password")
+                        .mask_toggle(),
                 ))
                 .child(field(
+                    palette,
                     "Confirm password",
-                    Input::new(&self.password_confirmation).mask_toggle(),
+                    Input::new(&self.password_confirmation)
+                        .aria_label("Confirm password")
+                        .mask_toggle(),
                 ))
                 .when_some(self.form_error.clone(), |this, error| {
-                    this.child(error_banner(error))
+                    this.child(error_banner(palette, error))
                 })
                 .child(modal_actions(
                     "Update password",
@@ -1746,19 +1771,21 @@ impl MainView {
             Modal::AwsConnection => v_flex()
                 .gap_4()
                 .child(modal_title("Connect AWS IAM Identity Center"))
-                .child(div().text_color(rgb(MUTED)).child(
+                .child(div().text_color(rgb(palette.muted)).child(
                     "The portal connection and resulting login tokens stay in the encrypted vault.",
                 ))
                 .child(field(
+                    palette,
                     "AWS access portal URL",
-                    Input::new(&self.aws_start_url),
+                    Input::new(&self.aws_start_url).aria_label("AWS access portal URL"),
                 ))
                 .child(field(
+                    palette,
                     "IAM Identity Center region",
-                    Input::new(&self.aws_region),
+                    Input::new(&self.aws_region).aria_label("IAM Identity Center region"),
                 ))
                 .when_some(self.form_error.clone(), |this, error| {
-                    this.child(error_banner(error))
+                    this.child(error_banner(palette, error))
                 })
                 .child(modal_actions(
                     "Save and sign in",
@@ -1769,8 +1796,13 @@ impl MainView {
             Modal::AwsAliases => v_flex()
                 .gap_4()
                 .h(px(580.))
+                // Shrinks in a short window; the account list scrolls instead.
+                .min_h_0()
                 .overflow_hidden()
                 .child(modal_title("Assign AWS profile aliases"))
+                .child(div().text_color(rgb(palette.muted)).child(
+                    "Use these names as profiles in ~/.aws/config. Clear an alias to skip that account.",
+                ))
                 .child(
                     div().flex_1().min_h_0().overflow_hidden().child(
                         v_flex()
@@ -1779,7 +1811,10 @@ impl MainView {
                             .gap_3()
                             .overflow_y_scrollbar()
                             .children(self.aws_aliases.iter().map(|account| {
-                                card()
+                                panel(palette)
+                                    .flex_shrink_0()
+                                    .p_4()
+                                    .gap_3()
                                     .child(
                                         h_flex()
                                             .gap_2()
@@ -1790,41 +1825,67 @@ impl MainView {
                                             )
                                             .child(
                                                 div()
-                                                    .font_family("monospace")
-                                                    .text_color(rgb(MUTED))
+                                                    .font_family(mono.clone())
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(palette.muted))
                                                     .child(account.account_id.clone()),
+                                            )
+                                            .child(div().flex_1())
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(palette.muted))
+                                                    .truncate()
+                                                    .child(account.email_address.clone()),
                                             ),
                                     )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(rgb(MUTED))
-                                            .child(account.email_address.clone()),
-                                    )
                                     .child(field(
+                                        palette,
                                         "Local profile alias",
-                                        Input::new(&account.profile),
+                                        Input::new(&account.profile).aria_label(format!(
+                                            "Local profile alias for {}",
+                                            account.account_name
+                                        )),
                                     ))
                                     .child(
                                         h_flex()
                                             .gap_3()
                                             .child(div().flex_1().child(field(
+                                                palette,
                                                 "Read-only role",
-                                                Input::new(&account.read_only_role),
+                                                Input::new(&account.read_only_role).aria_label(
+                                                    format!(
+                                                        "Read-only role for {}",
+                                                        account.account_name
+                                                    ),
+                                                ),
                                             )))
                                             .child(div().flex_1().child(field(
+                                                palette,
                                                 "Admin role",
-                                                Input::new(&account.admin_role),
+                                                Input::new(&account.admin_role).aria_label(
+                                                    format!(
+                                                        "Admin role for {}",
+                                                        account.account_name
+                                                    ),
+                                                ),
                                             ))),
                                     )
-                                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
-                                        format!("Available roles: {}", account.roles.join(", ")),
-                                    ))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(palette.muted))
+                                            .child(format!(
+                                                "Available roles: {}",
+                                                account.roles.join(", ")
+                                            )),
+                                    )
                             })),
                     ),
                 )
                 .when_some(self.form_error.clone(), |this, error| {
-                    this.child(error_banner(error))
+                    this.child(error_banner(palette, error))
                 })
                 .child(modal_actions(
                     "Save profile aliases",
@@ -1864,25 +1925,28 @@ impl MainView {
             .id("modal-overlay")
             .absolute()
             .inset_0()
+            // Leaves the title bar uncovered, so the window can still be dragged.
+            .top(TITLE_BAR_HEIGHT)
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui_kit::rgba(0x15211b66))
+            .p_4()
+            .bg(rgba(palette.overlay))
             .occlude()
             .child(
-                div()
+                v_flex()
                     .id("modal-panel")
                     .occlude()
                     .w(px(match modal {
-                        Modal::AwsAliases => 700.,
-                        _ => 500.,
+                        Modal::AwsAliases => 680.,
+                        _ => 480.,
                     }))
-                    .max_h(px(720.))
+                    .max_h_full()
                     .p_6()
-                    .bg(rgb(SURFACE))
+                    .bg(rgb(palette.surface))
                     .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded(px(16.))
+                    .border_color(rgb(palette.line))
+                    .rounded(px(12.))
                     .shadow_lg()
                     .child(body),
             )
@@ -1901,90 +1965,91 @@ impl Render for MainView {
         }
         self.refresh_grant_liveness(cx);
         let snapshot = Self::snapshot(cx);
+        let palette = Palette::current(cx);
         if !snapshot.vault_exists || !snapshot.unlocked {
+            let auth = self.render_auth(!snapshot.vault_exists, palette, cx);
             return v_flex()
                 .size_full()
-                .bg(rgb(BACKGROUND))
-                .child(
-                    TitleBar::new().child(
-                        h_flex()
-                            .w_full()
-                            .h_full()
-                            .pr_3()
-                            .items_center()
-                            .child(title_bar_brand()),
-                    ),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .child(self.render_auth(!snapshot.vault_exists, cx)),
-                )
+                .bg(rgb(palette.background))
+                .text_color(rgb(palette.ink))
+                .child(window_bar(palette, None))
+                .child(div().flex_1().min_h_0().child(auth))
                 .into_any_element();
         }
-        let content = match self.view {
-            View::Secrets => self.render_secrets(&snapshot, cx),
-            View::Aws => self.render_aws(&snapshot, cx),
-            View::Grants => self.render_grants(&snapshot, cx),
-            View::Activity => self.render_activity(&snapshot),
+        let PageContent { actions, body } = match self.page {
+            Page::Credentials => self.render_secrets(&snapshot, palette, cx),
+            Page::Aws => self.render_aws(&snapshot, palette, cx),
+            Page::Grants => self.render_grants(&snapshot, palette, cx),
+            Page::Activity => self.render_activity(&snapshot, palette, cx),
         };
+        let sidebar = self.render_sidebar(&snapshot, palette, cx);
         div()
             .relative()
             .size_full()
-            .bg(rgb(BACKGROUND))
-            .text_color(rgb(INK))
+            .bg(rgb(palette.background))
+            .text_color(rgb(palette.ink))
             .child(
-                v_flex()
-                    .size_full()
-                    .child(self.render_header(&snapshot, cx))
-                    .child(
+                v_flex().size_full().child(window_bar(palette, None)).child(
+                    h_flex().flex_1().min_h_0().child(sidebar).child(
                         div()
                             .id("main-scroll")
+                            .flex()
+                            .flex_col()
                             .flex_1()
-                            .min_h_0()
+                            .min_w_0()
+                            .h_full()
                             .overflow_y_scrollbar()
-                            .child(div().p_7().child(content)),
+                            .child(
+                                // Fills the viewport so an empty state can center itself.
+                                v_flex()
+                                    .flex_grow_1()
+                                    .flex_shrink_0()
+                                    .w_full()
+                                    .max_w(px(CONTENT_MAX_WIDTH))
+                                    .mx_auto()
+                                    .px_8()
+                                    .py_6()
+                                    .gap_6()
+                                    .child(page_header(page_title(self.page), actions))
+                                    .child(body),
+                            ),
                     ),
+                ),
             )
             .when_some(self.modal.clone(), |this, modal| {
-                this.child(self.render_modal(&modal, cx))
+                this.child(self.render_modal(&modal, palette, cx))
             })
             .when_some(self.toast.as_ref(), |this, toast| {
-                this.child(
-                    div()
-                        .absolute()
-                        .bottom_5()
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .px_4()
-                                .py_2()
-                                .rounded(px(10.))
-                                .bg(rgb(if toast.danger { RED } else { INK }))
-                                .text_color(rgb(SURFACE))
-                                .child(toast.message.clone()),
-                        ),
-                )
+                this.child(toast_view(palette, toast))
             })
             .into_any_element()
     }
 }
 
 pub struct RequestView {
+    focus_handle: FocusHandle,
     error: Option<String>,
     grant_process_choices: HashMap<String, ProcessIdentity>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl RequestView {
-    pub fn new() -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Tab can't start from nothing, so focus the window once it is drawn. Focusing the
+        // window rather than a control keeps Enter and Space from choosing a grant boundary or
+        // an answer by accident. Answer buttons are keyed by request, so answering one removes
+        // it and focus comes back here rather than moving to the next request's buttons.
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_handle.focus(window, cx)
+        });
+        let _subscriptions = vec![cx.on_focus_lost(window, |this, window, cx| {
+            this.focus_handle.focus(window, cx)
+        })];
         Self {
+            focus_handle: cx.focus_handle(),
             error: None,
             grant_process_choices: HashMap::new(),
+            _subscriptions,
         }
     }
 
@@ -2073,53 +2138,40 @@ impl RequestView {
         &self,
         request: &PendingRequest,
         unlocked: bool,
+        palette: Palette,
         cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
+    ) -> PageContent {
         let entity = cx.entity();
+        let mono = cx.theme().mono_font_family.clone();
         let process = self.grant_process(&request.id, &request.process_tree);
         let deny_id = request.id.clone();
         let once_id = request.id.clone();
         let grant_id = request.id.clone();
-        card()
-            .gap_4()
-            .border_color(rgb(if request.verified { LINE } else { AMBER }))
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(20.))
-                            .font_semibold()
-                            .child("Secret requested"),
-                    )
-                    .child(
-                        div()
-                            .font_family("monospace")
-                            .text_size(px(17.))
-                            .child(request.secret.clone()),
-                    )
-                    .child(status_pill(
-                        if request.verified {
-                            "Process verified"
-                        } else {
-                            "Process could not be verified"
-                        },
-                        if request.verified { GREEN } else { AMBER },
-                        SURFACE_MUTED,
-                    )),
-            )
+        let body = v_flex()
+            .gap_6()
+            .child(request_header(
+                palette,
+                IconName::KeyRound,
+                "Secret requested",
+                div().font_family(mono).child(request.secret.clone()),
+                request.verified,
+            ))
             .child(process_grant_selector(
+                palette,
                 &request.id,
                 &request.process_tree,
                 process.as_ref(),
                 request.verified,
                 entity.clone(),
             ))
+            .into_any_element();
+        let actions = h_flex()
+            .gap_2()
             .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(Button::new("deny-secret").danger().label("Deny").on_click({
+                Button::new(SharedString::from(format!("deny-secret-{}", request.id)))
+                    .outline()
+                    .label("Deny")
+                    .on_click({
                         let entity = entity.clone();
                         move |_, _, cx| {
                             entity.update(cx, |this, cx| {
@@ -2131,167 +2183,170 @@ impl RequestView {
                                 )
                             });
                         }
-                    }))
-                    .when(unlocked, |this| {
-                        this.child(
-                            Button::new("once-secret")
-                                .outline()
-                                .label("Allow once")
-                                .on_click({
-                                    let entity = entity.clone();
-                                    move |_, _, cx| {
-                                        entity.update(cx, |this, cx| {
-                                            this.respond_secret(
-                                                once_id.clone(),
-                                                ApprovalDecision::Once,
-                                                None,
-                                                cx,
-                                            )
-                                        });
-                                    }
-                                }),
-                        )
-                    })
-                    .when(unlocked && request.verified, |this| {
-                        this.child(
-                            Button::new("grant-secret")
-                                .primary()
-                                .label("Grant for 30 minutes")
-                                .on_click(move |_, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        this.respond_secret(
-                                            grant_id.clone(),
-                                            ApprovalDecision::Temporary,
-                                            process.clone(),
-                                            cx,
-                                        )
-                                    });
-                                }),
-                        )
-                    })
-                    .when(!unlocked, |this| {
-                        this.child(
-                            Button::new("unlock-main")
-                                .primary()
-                                .label("Open secretd to unlock")
-                                .on_click(|_, _, cx| crate::runtime::open_main(cx)),
-                        )
                     }),
             )
-            .into_any_element()
+            .when(unlocked, |this| {
+                this.child(
+                    Button::new(SharedString::from(format!("once-secret-{}", request.id)))
+                        .outline()
+                        .label("Allow once")
+                        .on_click({
+                            let entity = entity.clone();
+                            move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.respond_secret(
+                                        once_id.clone(),
+                                        ApprovalDecision::Once,
+                                        None,
+                                        cx,
+                                    )
+                                });
+                            }
+                        }),
+                )
+            })
+            .when(unlocked && request.verified, |this| {
+                this.child(
+                    Button::new(SharedString::from(format!("grant-secret-{}", request.id)))
+                        .primary()
+                        .label("Grant for 30 minutes")
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.respond_secret(
+                                    grant_id.clone(),
+                                    ApprovalDecision::Temporary,
+                                    process.clone(),
+                                    cx,
+                                )
+                            });
+                        }),
+                )
+            })
+            .when(!unlocked, |this| {
+                this.child(
+                    Button::new("unlock-main")
+                        .primary()
+                        .label("Open secretd to unlock")
+                        .on_click(|_, _, cx| crate::runtime::open_main(cx)),
+                )
+            })
+            .into_any_element();
+        PageContent {
+            actions: Some(actions),
+            body,
+        }
     }
 
     fn render_aws_request(
         &self,
         request: &PendingAwsCredentialRequest,
         unlocked: bool,
+        palette: Palette,
         cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
+    ) -> PageContent {
         let entity = cx.entity();
+        let mono = cx.theme().mono_font_family.clone();
         let process = self.grant_process(&request.id, &request.process_tree);
         let deny_id = request.id.clone();
         let read_id = request.id.clone();
         let admin_id = request.id.clone();
-        card()
-            .gap_4()
-            .border_color(rgb(if request.verified { LINE } else { AMBER }))
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(20.))
-                            .font_semibold()
-                            .child("AWS credentials requested"),
-                    )
-                    .child(
-                        div()
-                            .font_family("monospace")
-                            .text_size(px(17.))
-                            .child(format!("Profile: {}", request.profile)),
-                    ),
-            )
+        let body = v_flex()
+            .gap_6()
+            .child(request_header(
+                palette,
+                IconName::Cloud,
+                "AWS credentials requested",
+                h_flex()
+                    .gap_1p5()
+                    .child(div().text_color(rgb(palette.muted)).child("Profile"))
+                    .child(div().font_family(mono).child(request.profile.clone())),
+                request.verified,
+            ))
             .child(process_grant_selector(
+                palette,
                 &request.id,
                 &request.process_tree,
                 process.as_ref(),
                 request.verified,
                 entity.clone(),
             ))
+            .into_any_element();
+        let actions = h_flex()
+            .gap_2()
             .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .child(
-                        Button::new("deny-aws")
-                            .danger()
-                            .label(if request.verified {
-                                "Deny for 30 min"
-                            } else {
-                                "Deny"
-                            })
-                            .on_click({
-                                let entity = entity.clone();
-                                let process = process.clone();
-                                move |_, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        this.respond_aws(deny_id.clone(), None, process.clone(), cx)
-                                    });
-                                }
-                            }),
-                    )
-                    .when(unlocked, |this| {
-                        this.child(
-                            Button::new("read-aws")
-                                .outline()
-                                .label("Grant read-only")
-                                .on_click({
-                                    let entity = entity.clone();
-                                    let process = process.clone();
-                                    move |_, _, cx| {
-                                        entity.update(cx, |this, cx| {
-                                            this.respond_aws(
-                                                read_id.clone(),
-                                                Some(AwsAccessLevel::ReadOnly),
-                                                process.clone(),
-                                                cx,
-                                            )
-                                        });
-                                    }
-                                }),
-                        )
-                        .child(
-                            Button::new("admin-aws")
-                                .danger()
-                                .label("Grant admin")
-                                .on_click(move |_, _, cx| {
-                                    entity.update(cx, |this, cx| {
-                                        this.respond_aws(
-                                            admin_id.clone(),
-                                            Some(AwsAccessLevel::Admin),
-                                            process.clone(),
-                                            cx,
-                                        )
-                                    });
-                                }),
-                        )
+                Button::new(SharedString::from(format!("deny-aws-{}", request.id)))
+                    .outline()
+                    .label(if request.verified {
+                        "Deny for 30 min"
+                    } else {
+                        "Deny"
                     })
-                    .when(!unlocked, |this| {
-                        this.child(
-                            Button::new("unlock-main")
-                                .primary()
-                                .label("Open secretd to unlock")
-                                .on_click(|_, _, cx| crate::runtime::open_main(cx)),
-                        )
+                    .on_click({
+                        let entity = entity.clone();
+                        let process = process.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.respond_aws(deny_id.clone(), None, process.clone(), cx)
+                            });
+                        }
                     }),
             )
-            .into_any_element()
+            .when(unlocked, |this| {
+                this.child(
+                    Button::new(SharedString::from(format!("read-aws-{}", request.id)))
+                        .primary()
+                        .label("Grant read-only")
+                        .on_click({
+                            let entity = entity.clone();
+                            let process = process.clone();
+                            move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.respond_aws(
+                                        read_id.clone(),
+                                        Some(AwsAccessLevel::ReadOnly),
+                                        process.clone(),
+                                        cx,
+                                    )
+                                });
+                            }
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("admin-aws-{}", request.id)))
+                        .danger()
+                        .label("Grant admin")
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.respond_aws(
+                                    admin_id.clone(),
+                                    Some(AwsAccessLevel::Admin),
+                                    process.clone(),
+                                    cx,
+                                )
+                            });
+                        }),
+                )
+            })
+            .when(!unlocked, |this| {
+                this.child(
+                    Button::new("unlock-main")
+                        .primary()
+                        .label("Open secretd to unlock")
+                        .on_click(|_, _, cx| crate::runtime::open_main(cx)),
+                )
+            })
+            .into_any_element();
+        PageContent {
+            actions: Some(actions),
+            body,
+        }
     }
 }
 
 impl Render for RequestView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = Self::snapshot(cx);
+        let palette = Palette::current(cx);
         let show_aws = match (snapshot.pending_aws.first(), snapshot.pending.first()) {
             (Some(aws), Some(secret)) => aws.requested_at <= secret.requested_at,
             (Some(_), None) => true,
@@ -2301,33 +2356,24 @@ impl Render for RequestView {
             snapshot
                 .pending_aws
                 .first()
-                .map(|request| self.render_aws_request(request, snapshot.unlocked, cx))
+                .map(|request| self.render_aws_request(request, snapshot.unlocked, palette, cx))
         } else {
             snapshot
                 .pending
                 .first()
-                .map(|request| self.render_secret(request, snapshot.unlocked, cx))
+                .map(|request| self.render_secret(request, snapshot.unlocked, palette, cx))
         };
+        let (body, actions) = match request {
+            Some(PageContent { actions, body }) => (Some(body), actions),
+            None => (None, None),
+        };
+        let waiting = (snapshot.pending.len() + snapshot.pending_aws.len()).saturating_sub(1);
         v_flex()
+            .track_focus(&self.focus_handle)
             .size_full()
-            .bg(rgb(BACKGROUND))
-            .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .w_full()
-                        .h_full()
-                        .pr_3()
-                        .gap_2()
-                        .items_center()
-                        .child(title_bar_brand())
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(rgb(MUTED))
-                                .child("Access request"),
-                        ),
-                ),
-            )
+            .bg(rgb(palette.background))
+            .text_color(rgb(palette.ink))
+            .child(window_bar(palette, Some("secretd · Access request")))
             .child(
                 v_flex()
                     .id("request-content")
@@ -2335,27 +2381,37 @@ impl Render for RequestView {
                     .min_h_0()
                     .overflow_y_scrollbar()
                     .gap_4()
-                    .p_6()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(22.))
-                                    .font_semibold()
-                                    .child("Access request"),
-                            )
-                            .child(
-                                div()
-                                    .text_color(rgb(MUTED))
-                                    .child("Review the requesting process before granting access"),
-                            ),
-                    )
+                    .px_6()
+                    .py_5()
                     .when_some(self.error.clone(), |this, error| {
-                        this.child(error_banner(error))
+                        this.child(error_banner(palette, error))
                     })
-                    .when_some(request, |this, request| this.child(request)),
+                    .children(body),
             )
+            .when_some(actions, |this, actions| {
+                this.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap_4()
+                        .px_6()
+                        .py_4()
+                        .border_t_1()
+                        .border_color(rgb(palette.line))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(12.))
+                                .text_color(rgb(palette.muted))
+                                .when(waiting > 0, |this| {
+                                    this.child(format!(
+                                        "{waiting} more request{} waiting",
+                                        if waiting == 1 { "" } else { "s" }
+                                    ))
+                                }),
+                        )
+                        .child(actions),
+                )
+            })
             .into_any_element()
     }
 }
@@ -2382,177 +2438,613 @@ pub fn dismiss_oldest_request(cx: &mut App) {
     (cx.global::<AppState>().notify())();
 }
 
-fn counted_tab(label: &'static str, count: usize, color: gpui_kit::Hsla) -> Tab {
-    Tab::new()
-        .label(label)
-        .aria_label(format!("{label}, {count}"))
-        .when(count > 0, |tab| {
-            tab.suffix(
-                h_flex()
-                    .flex_shrink_0()
-                    .min_w(px(16.))
-                    .h(px(16.))
-                    .px_1()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(color)
-                    .text_color(rgb(0xffffff))
-                    .text_size(px(10.))
-                    .line_height(gpui_kit::relative(1.))
-                    .child(if count > 999 {
-                        "999+".into()
-                    } else {
-                        count.to_string()
-                    }),
+fn page_title(page: Page) -> &'static str {
+    match page {
+        Page::Credentials => "Credentials",
+        Page::Aws => "AWS SSO",
+        Page::Grants => "Grants",
+        Page::Activity => "Activity",
+    }
+}
+
+/// The standard title bar: a full-width strip that holds the window controls and drags the window.
+/// The system doesn't draw the window's title, so a window that needs one shows `title` here.
+fn window_bar(palette: Palette, title: Option<&'static str>) -> gpui_kit::AnyElement {
+    TitleBar::new()
+        .bg(rgb(palette.sidebar))
+        .border_color(rgb(palette.line))
+        .children(title.map(|title| {
+            div()
+                .text_size(px(13.))
+                .font_medium()
+                .text_color(rgb(palette.muted))
+                .child(title)
+        }))
+        .into_any_element()
+}
+
+fn page_header(title: &'static str, actions: Option<gpui_kit::AnyElement>) -> gpui_kit::AnyElement {
+    h_flex()
+        .min_h(px(32.))
+        .gap_3()
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(20.))
+                .font_semibold()
+                .child(title),
+        )
+        .children(actions)
+        .into_any_element()
+}
+
+/// A sidebar row. It is a button, so Tab reaches it and Enter or Space presses it.
+fn nav_row(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    label: &'static str,
+    active: bool,
+    palette: Palette,
+) -> gpui_kit::base::Button {
+    let row = gpui_kit::base::Button::new(id)
+        .accessibility_label(label)
+        .h(px(30.))
+        .px_2()
+        .gap_2()
+        .justify_start()
+        .rounded(px(6.))
+        // Transparent until keyboard focus tints it, so focusing doesn't shift the row.
+        .border_1()
+        .border_color(transparent_black())
+        .focus_visible(move |style| style.border_color(rgb(palette.accent)))
+        .cursor_pointer()
+        .child(Icon::new(icon).size(px(16.)).text_color(rgb(if active {
+            palette.accent
+        } else {
+            palette.muted
+        })))
+        .child(div().flex_1().child(label));
+    if active {
+        row.bg(rgb(palette.line)).font_medium()
+    } else {
+        row.hover(move |style| style.bg(translucent(palette.line, 0x99)))
+    }
+}
+
+fn nav_group(palette: Palette, label: &'static str) -> gpui_kit::AnyElement {
+    div()
+        .px_2()
+        .pt_4()
+        .pb_1()
+        .text_size(px(12.))
+        .font_semibold()
+        .text_color(rgb(palette.muted))
+        .child(label)
+        .into_any_element()
+}
+
+fn nav_item(
+    page: Page,
+    icon: IconName,
+    count: usize,
+    active: bool,
+    palette: Palette,
+    entity: Entity<MainView>,
+) -> gpui_kit::base::Button {
+    let title = page_title(page);
+    nav_row(title, icon, title, active, palette)
+        .role(Role::Tab)
+        .aria_selected(active)
+        .when(count > 0, |row| {
+            row.accessibility_label(format!("{title}, {count}")).child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(palette.muted))
+                    .child(count.to_string()),
             )
+        })
+        .on_click(move |_, _, cx| {
+            entity.update(cx, |this, cx| this.show_page(page, cx));
         })
 }
 
-fn field(label: impl Into<SharedString>, input: impl IntoElement + Styled) -> gpui_kit::AnyElement {
+fn settings_button(entity: Entity<MainView>) -> gpui_kit::AnyElement {
+    Button::new("settings")
+        .ghost()
+        .icon(IconName::Settings)
+        .tooltip("Settings")
+        .accessibility_label("Settings")
+        .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, cx| {
+            let current = theme::appearance(cx);
+            let menu = APPEARANCES.into_iter().fold(
+                menu.label("Appearance"),
+                |menu, (appearance, label)| {
+                    let entity = entity.clone();
+                    menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(appearance == current)
+                            .on_click(move |_, window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.set_appearance(appearance, window, cx)
+                                });
+                            }),
+                    )
+                },
+            );
+            let entity = entity.clone();
+            menu.separator()
+                .item(PopupMenuItem::new("Change master password…").on_click(
+                    move |_, window, cx| {
+                        entity.update(cx, |this, cx| this.open_password(window, cx));
+                    },
+                ))
+        })
+        .into_any_element()
+}
+
+fn field(
+    palette: Palette,
+    label: impl Into<SharedString>,
+    input: impl IntoElement + Styled,
+) -> gpui_kit::AnyElement {
     v_flex()
-        .gap_1()
+        .gap_1p5()
         .child(
             div()
-                .text_size(px(12.))
-                .font_semibold()
-                .text_color(rgb(MUTED))
+                .text_size(px(13.))
+                .font_medium()
+                .text_color(rgb(palette.muted))
                 .child(label.into()),
         )
         .child(input.w_full())
         .into_any_element()
 }
 
-fn card() -> gpui_kit::Div {
+/// A rounded group of rows, like a macOS settings section.
+fn panel(palette: Palette) -> gpui_kit::Div {
     v_flex()
         .w_full()
-        .gap_2()
-        .p_4()
-        .bg(rgb(SURFACE))
+        .overflow_hidden()
+        .rounded(px(10.))
         .border_1()
-        .border_color(rgb(LINE))
-        .rounded(px(14.))
+        .border_color(rgb(palette.line))
+        .bg(rgb(palette.surface))
 }
 
-fn brand() -> gpui_kit::AnyElement {
-    h_flex()
+fn list_row() -> gpui_kit::Div {
+    h_flex().w_full().min_h(px(48.)).px_4().py_2().gap_3()
+}
+
+/// A [`panel`] whose rows are separated by hairlines.
+fn rows_panel(palette: Palette, rows: Vec<gpui_kit::Div>) -> gpui_kit::Div {
+    panel(palette).children(rows.into_iter().enumerate().map(|(index, row)| {
+        row.when(index > 0, |row| {
+            row.border_t_1().border_color(rgb(palette.line))
+        })
+    }))
+}
+
+fn section(
+    palette: Palette,
+    title: &str,
+    trailing: Option<gpui_kit::AnyElement>,
+    body: impl IntoElement,
+) -> gpui_kit::AnyElement {
+    v_flex()
         .gap_2()
-        .items_center()
         .child(
-            div()
-                .size(px(30.))
-                .rounded(px(9.))
-                .bg(rgb(INK))
-                .text_color(rgb(SURFACE))
-                .flex()
-                .items_center()
-                .justify_center()
-                .font_semibold()
-                .child("S"),
-        )
-        .child(
-            v_flex()
-                .gap_0()
-                .child(div().font_semibold().text_size(px(17.)).child("secretd"))
+            h_flex()
+                .min_h(px(24.))
+                .px_1()
                 .child(
                     div()
-                        .text_size(px(9.))
-                        .text_color(rgb(MUTED))
-                        .child("LOCAL ENCRYPTED VAULT"),
+                        .flex_1()
+                        .text_size(px(13.))
+                        .font_semibold()
+                        .text_color(rgb(palette.muted))
+                        .child(title.to_string()),
+                )
+                .children(trailing),
+        )
+        .child(body)
+        .into_any_element()
+}
+
+fn detail_row(palette: Palette, label: &str, value: impl IntoElement) -> gpui_kit::Div {
+    list_row()
+        .min_h(px(44.))
+        .child(
+            div()
+                .w(px(140.))
+                .flex_shrink_0()
+                .text_color(rgb(palette.muted))
+                .child(label.to_string()),
+        )
+        .child(div().flex_1().min_w_0().child(value))
+}
+
+fn panel_message(
+    palette: Palette,
+    text: String,
+    action: Option<gpui_kit::AnyElement>,
+) -> gpui_kit::AnyElement {
+    h_flex()
+        .px_4()
+        .py_4()
+        .gap_4()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_color(rgb(palette.muted))
+                .child(text),
+        )
+        .children(action)
+        .into_any_element()
+}
+
+fn empty_state(
+    palette: Palette,
+    icon: IconName,
+    title: &str,
+    description: &str,
+    action: Option<gpui_kit::AnyElement>,
+) -> gpui_kit::AnyElement {
+    v_flex()
+        .flex_1()
+        .w_full()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        // Slightly above the true center, which looks centered below the toolbar.
+        .pb(px(48.))
+        .text_center()
+        .child(icon_tile(icon, 48., palette.muted, palette.line))
+        .child(
+            div()
+                .pt_2()
+                .text_size(px(16.))
+                .font_semibold()
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .max_w(px(420.))
+                .text_color(rgb(palette.muted))
+                .child(description.to_string()),
+        )
+        .when_some(action, |this, action| {
+            this.child(div().pt_3().child(action))
+        })
+        .into_any_element()
+}
+
+fn icon_tile(icon: IconName, size: f32, foreground: u32, background: u32) -> gpui_kit::AnyElement {
+    div()
+        .size(px(size))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(size * 0.28))
+        .bg(rgb(background))
+        .text_color(rgb(foreground))
+        .child(Icon::new(icon).size(px(size * 0.46)))
+        .into_any_element()
+}
+
+fn status_dot(color: u32) -> gpui_kit::AnyElement {
+    div()
+        .size(px(8.))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(rgb(color))
+        .into_any_element()
+}
+
+fn status_label(
+    palette: Palette,
+    color: u32,
+    label: &str,
+    detail: Option<String>,
+) -> gpui_kit::AnyElement {
+    h_flex()
+        .gap_2()
+        .child(status_dot(color))
+        .child(label.to_string())
+        .when_some(detail, |this, detail| {
+            this.child(
+                div()
+                    .min_w_0()
+                    .text_color(rgb(palette.muted))
+                    .truncate()
+                    .child(format!("· {detail}")),
+            )
+        })
+        .into_any_element()
+}
+
+fn tag(label: &str, foreground: u32, background: u32) -> gpui_kit::AnyElement {
+    div()
+        .flex_shrink_0()
+        .px_1p5()
+        .py(px(1.))
+        .rounded(px(5.))
+        .bg(rgb(background))
+        .text_color(rgb(foreground))
+        .text_size(px(11.))
+        .font_semibold()
+        .child(label.to_string())
+        .into_any_element()
+}
+
+fn footnote(palette: Palette, text: &str) -> gpui_kit::AnyElement {
+    div()
+        .px_1()
+        .text_size(px(12.))
+        .text_color(rgb(palette.muted))
+        .child(text.to_string())
+        .into_any_element()
+}
+
+fn translucent(color: u32, alpha: u8) -> gpui_kit::Rgba {
+    rgba((color << 8) | u32::from(alpha))
+}
+
+fn aws_login_banner(
+    status: &AwsLoginStatus,
+    palette: Palette,
+) -> Option<gpui_kit::AnyElement> {
+    match status {
+        AwsLoginStatus::Starting => Some(progress_banner(palette, "Checking AWS session…")),
+        AwsLoginStatus::Discovering => Some(progress_banner(
+            palette,
+            "Loading your AWS accounts and roles…",
+        )),
+        AwsLoginStatus::AwaitingUser(authorization) => {
+            let url = authorization.url.clone();
+            Some(
+                h_flex()
+                    .w_full()
+                    .p_4()
+                    .gap_4()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(rgb(palette.accent))
+                    .bg(rgb(palette.accent_soft))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(div().font_semibold().child("Finish signing in to AWS"))
+                            .child(div().text_color(rgb(palette.muted)).child(format!(
+                                "Complete sign-in in the browser on this computer. This request expires in {}.",
+                                duration_until_seconds(authorization.expires_at)
+                            ))),
+                    )
+                    .child(
+                        Button::new("open-aws-login")
+                            .primary()
+                            .icon(IconName::ExternalLink)
+                            .label("Open sign-in page")
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    )
+                    .into_any_element(),
+            )
+        }
+        AwsLoginStatus::Failed(error) => Some(error_banner(palette, error.clone())),
+        AwsLoginStatus::Idle | AwsLoginStatus::LoggedIn { .. } => None,
+    }
+}
+
+fn progress_banner(palette: Palette, text: &str) -> gpui_kit::AnyElement {
+    h_flex()
+        .w_full()
+        .px_4()
+        .py_3()
+        .gap_3()
+        .rounded(px(10.))
+        .border_1()
+        .border_color(rgb(palette.line))
+        .bg(rgb(palette.surface))
+        .child(Spinner::new().color(rgb(palette.accent).into()))
+        .child(text.to_string())
+        .into_any_element()
+}
+
+/// An AWS grant's access level, which opens a menu to switch it.
+fn level_button(
+    id: String,
+    profile: &str,
+    level: AwsAccessLevel,
+    palette: Palette,
+    entity: Entity<MainView>,
+    cx: &App,
+) -> gpui_kit::AnyElement {
+    let (foreground, background) = match level {
+        AwsAccessLevel::ReadOnly => (palette.green, palette.green_soft),
+        AwsAccessLevel::Admin => (palette.red, palette.red_soft),
+    };
+    let label = level_label(level);
+    Button::new(SharedString::from(format!("level-{id}")))
+        .xsmall()
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .color(rgb(background).into())
+                .foreground(rgb(foreground).into())
+                .hover(rgb(background).into())
+                .active(rgb(background).into()),
+        )
+        .label(label)
+        .accessibility_label(format!("{label} access to {profile}"))
+        .dropdown_caret(true)
+        .dropdown_menu(move |menu, _, _| {
+            [AwsAccessLevel::ReadOnly, AwsAccessLevel::Admin]
+                .into_iter()
+                .fold(menu, |menu, option| {
+                    let entity = entity.clone();
+                    let id = id.clone();
+                    menu.item(
+                        PopupMenuItem::new(level_label(option))
+                            .checked(option == level)
+                            .on_click(move |_, _, cx| {
+                                if option != level {
+                                    entity.update(cx, |this, cx| {
+                                        this.set_aws_grant_level(id.clone(), option, cx)
+                                    });
+                                }
+                            }),
+                    )
+                })
+        })
+        .into_any_element()
+}
+
+fn grant_row(
+    palette: Palette,
+    icon: IconName,
+    title: impl IntoElement,
+    process: &ProcessIdentity,
+    remaining: String,
+) -> gpui_kit::Div {
+    list_row()
+        .min_h(px(56.))
+        .child(Icon::new(icon).size(px(16.)).text_color(rgb(palette.muted)))
+        .child(
+            v_flex().flex_1().min_w_0().gap_0p5().child(title).child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(palette.muted))
+                    .truncate()
+                    .child(format!(
+                        "{} · PID {}",
+                        compact_process_label(process),
+                        process.pid
+                    )),
+            ),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(12.))
+                .text_color(rgb(palette.muted))
+                .child(remaining),
+        )
+}
+
+fn action_button(
+    id: String,
+    name: &str,
+    extend: bool,
+    aws: bool,
+    entity: Entity<MainView>,
+) -> Button {
+    Button::new(SharedString::from(format!(
+        "{}-{id}",
+        if extend { "extend" } else { "revoke" }
+    )))
+    .flex_shrink_0()
+    .when(extend, |button| {
+        button
+            .outline()
+            .label("+15 min")
+            .tooltip("Extend by 15 minutes")
+            .accessibility_label(format!("+15 min for {name}"))
+    })
+    .when(!extend, |button| {
+        button
+            .danger()
+            .outline()
+            .label("Revoke")
+            .accessibility_label(format!("Revoke access to {name}"))
+    })
+    .on_click(move |_, _, cx| {
+        entity.update(cx, |this, cx| {
+            this.mutate_grant(id.clone(), extend, aws, cx)
+        });
+    })
+}
+
+fn request_header(
+    palette: Palette,
+    icon: IconName,
+    title: &str,
+    subject: impl IntoElement,
+    verified: bool,
+) -> gpui_kit::AnyElement {
+    h_flex()
+        .items_start()
+        .gap_4()
+        .child(icon_tile(icon, 44., palette.accent, palette.accent_soft))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(17.))
+                        .font_semibold()
+                        .child(title.to_string()),
+                )
+                .child(
+                    // Wraps, so a long name moves the tag to its own line instead of off-screen.
+                    h_flex()
+                        .flex_wrap()
+                        .gap_x_2()
+                        .gap_y_1()
+                        .child(div().min_w_0().child(subject))
+                        .child(if verified {
+                            tag("Verified process", palette.green, palette.green_soft)
+                        } else {
+                            tag("Unverified process", palette.amber, palette.amber_soft)
+                        }),
                 ),
         )
         .into_any_element()
 }
 
-fn title_bar_brand() -> gpui_kit::AnyElement {
-    h_flex()
-        .gap_2()
-        .items_center()
-        .child(
-            div()
-                .size(px(24.))
-                .rounded(px(7.))
-                .bg(rgb(INK))
-                .text_color(rgb(SURFACE))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(12.))
-                .font_semibold()
-                .child("S"),
-        )
-        .child(div().font_semibold().text_size(px(15.)).child("secretd"))
-        .into_any_element()
-}
-
-fn credential_mark() -> gpui_kit::AnyElement {
+fn toast_view(palette: Palette, toast: &Toast) -> gpui_kit::AnyElement {
     div()
-        .size(px(32.))
-        .rounded(px(10.))
-        .bg(rgb(GREEN_SOFT))
-        .text_color(rgb(GREEN))
+        .absolute()
+        .bottom_5()
+        .left(px(SIDEBAR_WIDTH))
+        .right_0()
         .flex()
-        .items_center()
         .justify_center()
-        .font_semibold()
-        .child("•")
-        .into_any_element()
-}
-
-fn status_pill(text: &str, foreground: u32, background: u32) -> gpui_kit::AnyElement {
-    div()
-        .px_3()
-        .py_1()
-        .rounded(px(999.))
-        .bg(rgb(background))
-        .text_color(rgb(foreground))
-        .text_size(px(11.))
-        .font_semibold()
-        .child(text.to_string())
-        .into_any_element()
-}
-
-fn section_header(title: &str, subtitle: &str) -> gpui_kit::AnyElement {
-    v_flex()
-        .gap_1()
         .child(
             div()
-                .text_size(px(24.))
-                .font_semibold()
-                .text_color(rgb(INK))
-                .child(title.to_string()),
+                .px_4()
+                .py_2()
+                .rounded(px(10.))
+                .shadow_lg()
+                .bg(rgb(if toast.danger {
+                    palette.red
+                } else {
+                    palette.ink
+                }))
+                .text_color(rgb(palette.surface))
+                .child(toast.message.clone()),
         )
-        .child(div().text_color(rgb(MUTED)).child(subtitle.to_string()))
         .into_any_element()
 }
 
-fn empty_state(text: &str) -> gpui_kit::AnyElement {
+fn error_banner(palette: Palette, error: String) -> gpui_kit::AnyElement {
     div()
         .w_full()
-        .p_8()
-        .border_1()
-        .border_color(rgb(LINE))
-        .rounded(px(14.))
-        .bg(rgb(SURFACE))
-        .text_center()
-        .text_color(rgb(MUTED))
-        .child(text.to_string())
-        .into_any_element()
-}
-
-fn error_banner(error: String) -> gpui_kit::AnyElement {
-    div()
-        .w_full()
-        .p_3()
+        .px_4()
+        .py_3()
         .rounded(px(10.))
-        .bg(rgb(RED_SOFT))
-        .text_color(rgb(RED))
+        .bg(rgb(palette.red_soft))
+        .text_color(rgb(palette.red))
         .child(error)
         .into_any_element()
 }
 
 fn modal_title(title: &str) -> gpui_kit::AnyElement {
     div()
-        .text_size(px(22.))
+        .text_size(px(18.))
         .font_semibold()
         .child(title.to_string())
         .into_any_element()
@@ -2583,26 +3075,8 @@ fn modal_actions(
         .into_any_element()
 }
 
-fn action_button(
-    label: &'static str,
-    id: String,
-    extend: bool,
-    aws: bool,
-    entity: Entity<MainView>,
-) -> Button {
-    Button::new(SharedString::from(format!("{label}-{id}")))
-        .flex_shrink_0()
-        .outline()
-        .when(!extend, |button| button.danger())
-        .label(if extend { "+15 min" } else { "Revoke" })
-        .on_click(move |_, _, cx| {
-            entity.update(cx, |this, cx| {
-                this.mutate_grant(id.clone(), extend, aws, cx)
-            });
-        })
-}
-
 fn process_grant_selector(
+    palette: Palette,
     request_id: &str,
     processes: &[ProcessIdentity],
     selected: Option<&ProcessIdentity>,
@@ -2621,10 +3095,11 @@ fn process_grant_selector(
         .gap_2()
         .child(
             v_flex()
-                .gap_1()
+                .gap_0p5()
+                .px_1()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .font_semibold()
                         .child(if enabled {
                             "Process boundary"
@@ -2634,23 +3109,19 @@ fn process_grant_selector(
                 )
                 .child(
                     div()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
+                        .text_size(px(12.))
+                        .text_color(rgb(palette.muted))
                         .child(if enabled {
                             "Choose a process to include its child processes."
                         } else {
-                            "This process chain is informational because access can only be allowed once."
+                            "This process could not be verified, so access can only be allowed once."
                         }),
                 ),
         )
         .child(
-            v_flex()
+            panel(palette)
+                .py_2()
                 .gap_1()
-                .p_2()
-                .rounded(px(10.))
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(SURFACE_MUTED))
                 .children(grantable.into_iter().enumerate().map(|(depth, process)| {
                     let process = process.clone();
                     let request_id = request_id.to_string();
@@ -2663,7 +3134,9 @@ fn process_grant_selector(
                     let entity = entity.clone();
                     h_flex()
                         .gap_2()
-                        .pl(px(depth as f32 * 16.))
+                        .pl(px(12. + depth as f32 * 16.))
+                        .pr_3()
+                        .py_0p5()
                         .child(
                             Radio::new(radio_id)
                                 .checked(is_selected)
@@ -2684,17 +3157,12 @@ fn process_grant_selector(
                         )
                         .child(
                             div()
-                                .text_size(px(10.))
-                                .text_color(rgb(MUTED))
+                                .text_size(px(11.))
+                                .text_color(rgb(palette.muted))
                                 .child(format!("PID {process_pid}")),
                         )
                         .when(is_requester, |this| {
-                            this.child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(rgb(GREEN))
-                                    .child("requester"),
-                            )
+                            this.child(tag("Requester", palette.green, palette.green_soft))
                         })
                 })),
         )
@@ -2705,14 +3173,10 @@ fn process_grant_selector(
                 .next()
                 .filter(|name| !name.is_empty())
                 .unwrap_or(&selected.executable);
-            this.child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(GREEN))
-                    .child(format!(
-                        "Selected: {name} and its child processes."
-                    )),
-            )
+            this.child(footnote(
+                palette,
+                &format!("Selected: {name} and its child processes."),
+            ))
         })
         .into_any_element()
 }
@@ -2809,22 +3273,26 @@ fn suggested_role(roles: &[String], level: AwsAccessLevel) -> String {
 }
 
 fn duration_until(timestamp: u64) -> String {
-    let seconds = timestamp
-        .saturating_sub(secretd::grants::now_millis())
-        .div_ceil(1_000);
-    if seconds >= 60 {
-        format!("{}m", seconds.div_ceil(60))
-    } else {
-        format!("{seconds}s")
-    }
+    format_duration(
+        timestamp
+            .saturating_sub(secretd::grants::now_millis())
+            .div_ceil(1_000),
+    )
 }
 
 fn duration_until_seconds(timestamp: u64) -> String {
-    let seconds = timestamp.saturating_sub(secretd::aws::now_seconds());
-    if seconds >= 60 {
-        format!("{}m", seconds.div_ceil(60))
-    } else {
-        format!("{seconds}s")
+    format_duration(timestamp.saturating_sub(secretd::aws::now_seconds()))
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds.div_ceil(60);
+    match (minutes / 60, minutes % 60) {
+        (0, minutes) => format!("{minutes}m"),
+        (hours, 0) => format!("{hours}h"),
+        (hours, minutes) => format!("{hours}h {minutes}m"),
     }
 }
 
@@ -2838,6 +3306,13 @@ fn duration_since(timestamp: u64) -> String {
         format!("{seconds}s ago")
     } else {
         format!("{}m ago", seconds / 60)
+    }
+}
+
+fn level_label(level: AwsAccessLevel) -> &'static str {
+    match level {
+        AwsAccessLevel::ReadOnly => "Read-only",
+        AwsAccessLevel::Admin => "Admin",
     }
 }
 
@@ -2896,25 +3371,12 @@ fn rebuild_tray_menu(menu: &Menu, snapshot: &AppSnapshot) -> tray_icon::menu::Re
     Ok(())
 }
 
-pub fn configure_theme(cx: &mut App) {
-    ThemeRegistry::global_mut(cx)
-        .load_themes_from_str(CATPPUCCIN_LATTE_THEME)
-        .expect("embedded Catppuccin Latte theme must be valid");
-    let latte = ThemeRegistry::global(cx)
-        .themes()
-        .get("Catppuccin Latte")
-        .cloned()
-        .expect("embedded Catppuccin Latte theme must be registered");
-    let theme = Theme::global_mut(cx);
-    theme.apply_config(&latte);
-    theme.font_size = px(14.);
-    theme.radius = px(8.);
-    theme.radius_lg = px(14.);
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{compact_process_label, default_grant_process, suggested_alias, suggested_role};
+    use super::{
+        compact_process_label, default_grant_process, format_duration, suggested_alias,
+        suggested_role,
+    };
     use secretd::aws::AwsAccessLevel;
     use secretd::process::ProcessIdentity;
 
@@ -2945,6 +3407,14 @@ mod tests {
             suggested_role(&roles, AwsAccessLevel::Admin),
             "AdministratorAccess"
         );
+    }
+
+    #[test]
+    fn durations_round_up_to_minutes_and_show_hours() {
+        assert_eq!(format_duration(42), "42s");
+        assert_eq!(format_duration(61), "2m");
+        assert_eq!(format_duration(3_600), "1h");
+        assert_eq!(format_duration(28_500), "7h 55m");
     }
 
     #[test]

@@ -36,6 +36,10 @@ Ayatana AppIndicator, xdo, Wayland, and XKB runtime libraries from the host dist
 The vault uses PBKDF2-HMAC-SHA-256 with 600,000 iterations and AES-256-GCM. Secret names and values
 are encrypted together. Temporary grants and activity history exist only in memory.
 
+By default the window follows the system light or dark appearance. Choose System, Light, or Dark
+from the settings menu at the bottom of the sidebar. secretd saves the choice, and the page the main
+window last showed, in `settings.json` next to the vault.
+
 ## AWS IAM Identity Center
 
 secretd handles IAM Identity Center browser login with PKCE without invoking the AWS CLI or storing

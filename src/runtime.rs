@@ -6,13 +6,13 @@ use std::{
 
 use gpui_kit::component::{Root, TitleBar};
 use gpui_kit::{
-    App, AppContext as _, Bounds, Entity, Global, KeyBinding, QuitMode, WeakEntity, WindowBounds,
-    WindowHandle, WindowKind, WindowOptions, actions, px, size,
+    App, AppContext as _, Bounds, Entity, Global, KeyBinding, QuitMode, WeakEntity, Window,
+    WindowBounds, WindowDecorations, WindowHandle, WindowKind, WindowOptions, actions, px, size,
 };
 
-use crate::app::{
-    AppEvent, AppState, MainView, RequestView, configure_theme, dismiss_oldest_request,
-};
+use crate::app::{AppEvent, AppState, MainView, RequestView, dismiss_oldest_request};
+use crate::preferences;
+use crate::theme::{configure_theme, follow_appearance};
 
 const MAIN_WINDOW_SIZE: (f32, f32) = (1040., 700.);
 const REQUEST_WINDOW_SIZE: (f32, f32) = (620., 520.);
@@ -48,12 +48,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let (sender, receiver) = mpsc::channel();
     let show_on_launch = std::env::args().any(|argument| argument == "--show");
     let app = gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(crate::assets::Assets)
         .with_quit_mode(QuitMode::Explicit);
 
     app.run(move |cx| {
         configure_platform_application();
         gpui_kit::init(cx);
+        preferences::load(cx);
         configure_theme(cx);
         let state = match AppState::new(sender) {
             Ok(state) => state,
@@ -91,6 +92,42 @@ fn configure_platform_application() {
 
 #[cfg(not(target_os = "macos"))]
 fn configure_platform_application() {}
+
+/// Keeps the green button lit on a window that can't be resized. AppKit only enables the button
+/// on a resizable window, so the window becomes resizable with its size pinned and full screen
+/// off, and the button loses its action: AppKit's zoom nudges a window whose size is pinned.
+#[cfg(target_os = "macos")]
+fn light_zoom_button(window: &Window) {
+    use objc2_app_kit::{NSView, NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: GPUI's AppKit handle points at GPUI's view in this window, which outlives this
+    // call, and windows open on the main thread.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let Some(native) = view.window() else {
+        return;
+    };
+    let size = native.contentRectForFrameRect(native.frame()).size;
+    native.setContentMinSize(size);
+    native.setContentMaxSize(size);
+    native.setCollectionBehavior(
+        native.collectionBehavior() | NSWindowCollectionBehavior::FullScreenNone,
+    );
+    native.setStyleMask(native.styleMask() | NSWindowStyleMask::Resizable);
+    if let Some(zoom) = native.standardWindowButton(NSWindowButton::ZoomButton) {
+        // SAFETY: Clearing the action only stops the button from sending one.
+        unsafe { zoom.setAction(None) };
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn light_zoom_button(_: &Window) {}
 
 fn observe_closed_windows(cx: &mut App) {
     cx.on_window_closed(|cx, id| {
@@ -245,14 +282,23 @@ pub(crate) fn open_main(cx: &mut App) {
     );
     let mut view_entity: Option<Entity<MainView>> = None;
     let options = WindowOptions {
-        titlebar: Some(TitleBar::title_bar_options()),
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        // On macOS the window keeps the size it opens at: it can't be resized, zoomed, or made
+        // full screen. GPUI can't fix a window's size on Linux, so there it stays resizable down
+        // to this minimum.
+        is_resizable: cfg!(not(target_os = "macos")),
         window_min_size: Some(size(px(720.), px(520.))),
-        ..Default::default()
+        // On Linux the title bar draws the window controls itself, so the window manager doesn't
+        // add a title bar of its own.
+        window_decorations: Some(WindowDecorations::Client),
+        // The title bar handles double clicks itself, so AppKit doesn't zoom the window too.
+        ..TitleBar::window_options()
     };
     match cx.open_window(options, |window, cx| {
         window.set_window_title("secretd");
         window.on_window_should_close(cx, |_, _| true);
+        light_zoom_button(window);
+        follow_appearance(window, cx);
         let view = cx.new(|cx| MainView::new(window, cx));
         view_entity = Some(view.clone());
         cx.new(|cx| Root::new(view, window, cx))
@@ -289,17 +335,25 @@ fn open_request(cx: &mut App) {
         cx,
     );
     let options = WindowOptions {
-        kind: WindowKind::PopUp,
+        // On macOS a pop-up stays above other windows. On X11 the window manager doesn't manage
+        // pop-ups, so the window couldn't be moved, minimized, maximized, or focused. Wayland
+        // already opens a pop-up as a normal window.
+        kind: if cfg!(target_os = "macos") {
+            WindowKind::PopUp
+        } else {
+            WindowKind::Normal
+        },
         focus: false,
-        titlebar: Some(TitleBar::title_bar_options()),
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(560.), px(460.))),
-        ..Default::default()
+        window_decorations: Some(WindowDecorations::Client),
+        ..TitleBar::window_options()
     };
     let mut view_entity: Option<Entity<RequestView>> = None;
     match cx.open_window(options, |window, cx| {
         window.set_window_title("secretd access request");
-        let view = cx.new(|_| RequestView::new());
+        follow_appearance(window, cx);
+        let view = cx.new(|cx| RequestView::new(window, cx));
         view_entity = Some(view.clone());
         cx.new(|cx| Root::new(view, window, cx))
     }) {

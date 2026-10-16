@@ -13,10 +13,16 @@ use secretd::{
 
 #[path = "../app.rs"]
 mod app;
+#[path = "../assets.rs"]
+mod assets;
 #[path = "../icon.rs"]
 mod icon;
+#[path = "../preferences.rs"]
+mod preferences;
 #[path = "../runtime.rs"]
 mod runtime;
+#[path = "../theme.rs"]
+mod theme;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {

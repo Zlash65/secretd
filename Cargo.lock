@@ -7050,6 +7050,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "pbkdf2 0.13.0",
  "png 0.18.1",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sha2 0.11.0",
