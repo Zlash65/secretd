@@ -34,6 +34,10 @@ impl GrantStore {
                 "Grant duration must be between 1 and {MAX_GRANT_SECONDS} seconds"
             ));
         }
+        // A new grant for the same secret and process replaces the old one, so there is one
+        // grant to revoke.
+        self.grants
+            .retain(|grant| grant.resource != resource || !same_process(&grant.process, &process));
         let now = now_millis();
         let grant = Grant {
             id: Uuid::new_v4().to_string(),
@@ -107,6 +111,27 @@ mod tests {
             executable: "/bin/tool".into(),
             command: "tool".into(),
         }
+    }
+
+    #[test]
+    fn a_new_grant_replaces_one_for_the_same_secret_and_process() {
+        let mut store = GrantStore::default();
+        let shell = ProcessIdentity {
+            pid: 10,
+            ppid: 1,
+            started_at: "start".into(),
+            executable: "/bin/zsh".into(),
+            command: "zsh".into(),
+        };
+        store.add("deploy/token".into(), shell.clone(), 60).unwrap();
+        let replacement = store
+            .add("deploy/token".into(), shell.clone(), 120)
+            .unwrap();
+        store.add("other/token".into(), shell, 60).unwrap();
+
+        let grants = store.list();
+        assert_eq!(grants.len(), 2);
+        assert!(grants.iter().any(|grant| grant.id == replacement.id));
     }
 
     #[test]

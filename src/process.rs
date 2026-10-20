@@ -1,4 +1,4 @@
-use std::net::TcpStream;
+use std::{collections::HashMap, net::TcpStream};
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -63,11 +63,33 @@ pub fn is_launchd_process(process: &ProcessIdentity) -> bool {
     executable == "launchd" || invoked == "launchd"
 }
 
+/// The live identities of these processes, keyed by PID. Processes that have exited are left out.
+#[cfg(not(target_os = "macos"))]
+pub fn inspect_processes(pids: &[u32]) -> Result<HashMap<u32, ProcessIdentity>, String> {
+    pids.iter()
+        .filter_map(|&pid| inspect_process(pid).transpose())
+        .map(|identity| identity.map(|identity| (identity.pid, identity)))
+        .collect()
+}
+
+/// Whether the process still runs. A failed inspection says nothing about the process, so it
+/// counts as running rather than ending a grant early.
 pub fn process_is_alive(process: &ProcessIdentity) -> bool {
-    inspect_process(process.pid)
-        .ok()
-        .flatten()
-        .is_some_and(|current| same_process(&current, process))
+    match inspect_process(process.pid) {
+        Ok(current) => current.is_some_and(|current| same_process(&current, process)),
+        Err(_) => true,
+    }
+}
+
+/// Whether the process still runs under the parent it had. Its parent exiting orphans it, for
+/// example when a timeout kills the shell that ran it. A failed inspection says nothing about the
+/// process, so it counts as unchanged rather than ending a wait early.
+pub fn process_runs_under_parent(process: &ProcessIdentity) -> bool {
+    match inspect_process(process.pid) {
+        Ok(current) => current
+            .is_some_and(|current| same_process(&current, process) && current.ppid == process.ppid),
+        Err(_) => true,
+    }
 }
 
 pub fn omit_secretd_client_processes(tree: &[ProcessIdentity]) -> Vec<ProcessIdentity> {
@@ -116,42 +138,93 @@ pub fn verify_connection_owner(pid: u32, connection: &TcpStream) -> bool {
 
 #[cfg(target_os = "macos")]
 fn inspect_process(pid: u32) -> Result<Option<ProcessIdentity>, String> {
-    let Some(ppid) = ps(pid, "ppid=")? else {
-        return Ok(None);
-    };
-    let Some(started_at) = ps(pid, "lstart=")? else {
-        return Ok(None);
-    };
-    let Some(executable) = ps(pid, "comm=")? else {
-        return Ok(None);
-    };
-    let Some(command) = ps(pid, "command=")? else {
-        return Ok(None);
-    };
-    let Ok(ppid) = ppid.trim().parse::<u32>() else {
-        return Ok(None);
-    };
-    Ok(Some(ProcessIdentity {
-        pid,
-        ppid,
-        started_at: started_at.trim().into(),
-        executable: executable.trim().into(),
-        command: command.trim().into(),
-    }))
+    Ok(inspect_processes(&[pid])?.remove(&pid))
+}
+
+/// The live identities of these processes, keyed by PID. Processes that have exited are left out.
+/// Two `ps` calls cover any number of processes.
+#[cfg(target_os = "macos")]
+pub fn inspect_processes(pids: &[u32]) -> Result<HashMap<u32, ProcessIdentity>, String> {
+    if pids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let commands: HashMap<u32, String> = ps(pids, "pid=,command=")?
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = split_words(line, 1)?;
+            Some((pid.parse().ok()?, command.trim_end().to_string()))
+        })
+        .collect();
+    let identities = ps(pids, "pid=,ppid=,lstart=,comm=")?
+        .lines()
+        .filter_map(|line| {
+            let (pid, ppid, started_at, executable) = parse_ps_identity(line)?;
+            // A process that started between the two calls under one of these PIDs has no
+            // command, so it is left out.
+            let command = commands.get(&pid)?.clone();
+            let identity = ProcessIdentity {
+                pid,
+                ppid,
+                started_at,
+                executable,
+                command,
+            };
+            Some((pid, identity))
+        })
+        .collect();
+    Ok(identities)
 }
 
 #[cfg(target_os = "macos")]
-fn ps(pid: u32, field: &str) -> Result<Option<String>, String> {
+fn ps(pids: &[u32], fields: &str) -> Result<String, String> {
+    let pids = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    // The output is read as UTF-8, and the C time format keeps the start time at five words in
+    // any language. An inherited LC_ALL would override both, so it is removed. UTC keeps a
+    // timezone change from changing the start time used to identify a running process.
     let output = Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", field])
+        .args(["-p", &pids, "-o", fields])
+        .env_remove("LC_ALL")
+        .env("LC_CTYPE", "UTF-8")
+        .env("LC_TIME", "C")
+        .env("TZ", "UTC0")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Ok(None);
+    // ps fails when none of the processes exist, and prints nothing for them.
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Parses a `ps -o pid=,ppid=,lstart=,comm=` line. The start time is five words, and the program
+/// path after it can contain spaces.
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_identity(line: &str) -> Option<(u32, u32, String, String)> {
+    let (pid, rest) = split_words(line, 1)?;
+    let (ppid, rest) = split_words(rest, 1)?;
+    let (started_at, executable) = split_words(rest, 5)?;
+    let executable = executable.trim_end();
+    Some((
+        pid.parse().ok()?,
+        ppid.parse().ok()?,
+        started_at.to_string(),
+        executable.to_string(),
+    ))
+}
+
+/// Splits the first `count` words off a line, keeping the spacing between them, from the rest.
+#[cfg(any(target_os = "macos", test))]
+fn split_words(line: &str, count: usize) -> Option<(&str, &str)> {
+    let line = line.trim_start();
+    let mut rest = line;
+    for _ in 0..count {
+        let word = rest.split_whitespace().next()?;
+        rest = rest.trim_start().strip_prefix(word)?;
     }
-    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+    Some((&line[..line.len() - rest.len()], rest.trim_start()))
 }
 
 #[cfg(target_os = "macos")]
@@ -296,10 +369,88 @@ mod tests {
             .next()
             .unwrap();
         assert!(process_is_alive(&current));
+        assert!(process_runs_under_parent(&current));
+
+        // It was recorded under a parent it no longer runs under, as if that parent had exited.
+        let mut orphaned = current.clone();
+        orphaned.ppid = u32::MAX;
+        assert!(process_is_alive(&orphaned));
+        assert!(!process_runs_under_parent(&orphaned));
 
         let mut reused_pid = current;
         reused_pid.started_at.push_str("-different");
         assert!(!process_is_alive(&reused_pid));
+        assert!(!process_runs_under_parent(&reused_pid));
+    }
+
+    #[test]
+    fn inspects_several_processes_at_once() {
+        let current = std::process::id();
+        let expected = inspect_process_tree(current, 1).unwrap().remove(0);
+        let live = inspect_processes(&[current, 1]).unwrap();
+        assert_eq!(live.get(&current), Some(&expected));
+        assert!(inspect_processes(&[]).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_start_times_use_utc() {
+        let pid = std::process::id();
+        let expected = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC0")
+            .output()
+            .unwrap();
+        assert!(expected.status.success());
+        let actual = inspect_process(pid).unwrap().unwrap();
+        assert_eq!(
+            actual.started_at,
+            String::from_utf8(expected.stdout).unwrap().trim()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_process_can_have_a_blank_program_name() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = Command::new("/bin/sleep")
+            .arg0("   ")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let identity = inspect_process(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let identity = identity.unwrap().expect("the process is still running");
+        assert_eq!(identity.pid, child.id());
+        assert!(identity.executable.is_empty());
+    }
+
+    #[test]
+    fn parses_ps_lines_with_padded_dates_and_spaced_paths() {
+        let (pid, ppid, started_at, executable) = parse_ps_identity(
+            "  312   301 Fri Oct  9 08:05:12 2026     /Applications/T3 Code.app/Contents/MacOS/T3 Code",
+        )
+        .unwrap();
+        assert_eq!((pid, ppid), (312, 301));
+        assert_eq!(started_at, "Fri Oct  9 08:05:12 2026");
+        assert_eq!(
+            executable,
+            "/Applications/T3 Code.app/Contents/MacOS/T3 Code"
+        );
+        assert!(parse_ps_identity("312 301 Fri Oct 9 08:05:12").is_none());
+        assert!(parse_ps_identity("pid 301 Fri Oct 9 08:05:12 2026 /bin/zsh").is_none());
+        assert_eq!(
+            parse_ps_identity("312 301 Fri Oct 9 08:05:12 2026     "),
+            Some((312, 301, "Fri Oct 9 08:05:12 2026".into(), String::new()))
+        );
+        assert_eq!(
+            split_words("  42 aws sts get-caller-identity ", 1),
+            Some(("42", "aws sts get-caller-identity "))
+        );
     }
 
     #[test]

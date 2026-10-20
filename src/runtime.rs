@@ -10,12 +10,12 @@ use gpui_kit::{
     WindowBounds, WindowDecorations, WindowHandle, WindowKind, WindowOptions, actions, px, size,
 };
 
-use crate::app::{AppEvent, AppState, MainView, RequestView, dismiss_oldest_request};
+use crate::app::{AppEvent, AppState, MainView, RequestView};
 use crate::preferences;
 use crate::theme::{configure_theme, follow_appearance};
 
 const MAIN_WINDOW_SIZE: (f32, f32) = (1040., 700.);
-const REQUEST_WINDOW_SIZE: (f32, f32) = (620., 520.);
+const REQUEST_WINDOW_SIZE: (f32, f32) = (640., 640.);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 #[cfg(target_os = "macos")]
@@ -38,7 +38,6 @@ struct Windows {
     main_view: Option<WeakEntity<MainView>>,
     request: Option<WindowHandle<Root>>,
     request_view: Option<WeakEntity<RequestView>>,
-    closing_request: bool,
     opened_aws_login_url: Option<String>,
 }
 
@@ -130,30 +129,20 @@ fn light_zoom_button(window: &Window) {
 fn light_zoom_button(_: &Window) {}
 
 fn observe_closed_windows(cx: &mut App) {
+    // The views drop their GPUI input buffers with their windows. The controller and IPC server
+    // are global. Closing the request window dismisses its requests in the view.
     cx.on_window_closed(|cx, id| {
-        let (was_main, was_request, intentional) = {
-            let windows = cx.global_mut::<Windows>();
-            let was_main = windows.main.is_some_and(|window| window.window_id() == id);
-            let was_request = windows
-                .request
-                .is_some_and(|window| window.window_id() == id);
-            let intentional = windows.closing_request;
-            if was_main {
-                windows.main = None;
-                windows.main_view = None;
-            }
-            if was_request {
-                windows.request = None;
-                windows.request_view = None;
-                windows.closing_request = false;
-            }
-            (was_main, was_request, intentional)
-        };
-        if was_main {
-            // The view drops its GPUI input buffers here. The controller and IPC server are global.
+        let windows = cx.global_mut::<Windows>();
+        if windows.main.is_some_and(|window| window.window_id() == id) {
+            windows.main = None;
+            windows.main_view = None;
         }
-        if was_request && !intentional {
-            dismiss_oldest_request(cx);
+        if windows
+            .request
+            .is_some_and(|window| window.window_id() == id)
+        {
+            windows.request = None;
+            windows.request_view = None;
         }
     })
     .detach();
@@ -351,7 +340,7 @@ fn open_request(cx: &mut App) {
     };
     let mut view_entity: Option<Entity<RequestView>> = None;
     match cx.open_window(options, |window, cx| {
-        window.set_window_title("secretd access request");
+        window.set_window_title("secretd access requests");
         follow_appearance(window, cx);
         let view = cx.new(|cx| RequestView::new(window, cx));
         view_entity = Some(view.clone());
@@ -370,7 +359,6 @@ fn close_request(cx: &mut App) {
     let Some(handle) = cx.global::<Windows>().request else {
         return;
     };
-    cx.global_mut::<Windows>().closing_request = true;
     if handle
         .update(cx, |_, window, _| window.remove_window())
         .is_err()
@@ -378,7 +366,6 @@ fn close_request(cx: &mut App) {
         let windows = cx.global_mut::<Windows>();
         windows.request = None;
         windows.request_view = None;
-        windows.closing_request = false;
     }
 }
 

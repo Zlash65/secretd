@@ -6,9 +6,10 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{Receiver, RecvTimeoutError},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -22,7 +23,9 @@ use crate::{
         AwsRequestOutcome, AwsRequestResolution, Controller, RequestOutcome, RequestResolution,
     },
     paths::ensure_parent,
-    process::{inspect_process_tree, verify_connection_owner},
+    process::{
+        ProcessIdentity, inspect_process_tree, process_runs_under_parent, verify_connection_owner,
+    },
 };
 
 use super::protocol::{ClientRequest, EndpointFile};
@@ -30,6 +33,7 @@ use super::protocol::{ClientRequest, EndpointFile};
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const AWS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const ORIGIN_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CONNECTIONS: usize = 64;
 
 pub struct RequestServer {
@@ -192,13 +196,43 @@ fn handle_connection(
 fn request_process(
     pid: u32,
     connection: &TcpStream,
-) -> Result<(bool, Vec<crate::process::ProcessIdentity>), String> {
+) -> Result<(bool, Vec<ProcessIdentity>), String> {
     let verified = verify_connection_owner(pid, connection);
     let tree = inspect_process_tree(pid, 12)?;
     if tree.is_empty() {
         return Err("Unable to inspect the requesting process".into());
     }
     Ok((verified, tree))
+}
+
+enum Unanswered {
+    TimedOut,
+    Abandoned,
+}
+
+/// Waits for the user's answer. Stops early when the requesting process exits or is orphaned, for
+/// example when a script's own timeout kills it or the shell that ran it, so the approval window
+/// only lists requests that still matter.
+fn wait_for_answer<T>(
+    receiver: &Receiver<T>,
+    origin: &ProcessIdentity,
+    timeout: Duration,
+) -> Result<T, Unanswered> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Unanswered::TimedOut);
+        }
+        match receiver.recv_timeout(remaining.min(ORIGIN_CHECK_INTERVAL)) {
+            Ok(answer) => return Ok(answer),
+            Err(RecvTimeoutError::Disconnected) => return Err(Unanswered::TimedOut),
+            Err(RecvTimeoutError::Timeout) if !process_runs_under_parent(origin) => {
+                return Err(Unanswered::Abandoned);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 fn handle_secret_request(
@@ -216,9 +250,13 @@ fn handle_secret_request(
         .map_err(|error| error.to_string())?;
     match outcome {
         RequestOutcome::Immediate(value) => Ok(value),
-        RequestOutcome::Pending { id, receiver } => {
+        RequestOutcome::Pending {
+            id,
+            origin,
+            receiver,
+        } => {
             notify();
-            match receiver.recv_timeout(REQUEST_TIMEOUT) {
+            match wait_for_answer(&receiver, &origin, REQUEST_TIMEOUT) {
                 Ok(RequestResolution::Approved) => {
                     let value = controller
                         .lock()
@@ -236,9 +274,12 @@ fn handle_secret_request(
                     notify();
                     Err(error)
                 }
-                Err(_) => {
+                Err(unanswered) => {
                     if let Ok(mut controller) = controller.lock() {
-                        controller.timeout_request(&id);
+                        match unanswered {
+                            Unanswered::TimedOut => controller.timeout_request(&id),
+                            Unanswered::Abandoned => controller.withdraw_request(&id),
+                        }
                     }
                     notify();
                     Err("Request denied or timed out".into())
@@ -266,17 +307,24 @@ fn handle_aws_request(
         AwsRequestOutcome::Denied => {
             return Err("AWS credential request denied".into());
         }
-        AwsRequestOutcome::Pending { id, receiver } => {
+        AwsRequestOutcome::Pending {
+            id,
+            origin,
+            receiver,
+        } => {
             notify();
-            match receiver.recv_timeout(AWS_REQUEST_TIMEOUT) {
+            match wait_for_answer(&receiver, &origin, AWS_REQUEST_TIMEOUT) {
                 Ok(AwsRequestResolution::Approved(level)) => level,
                 Ok(AwsRequestResolution::Denied) => {
                     notify();
                     return Err("AWS credential request denied or timed out".into());
                 }
-                Err(_) => {
+                Err(unanswered) => {
                     if let Ok(mut controller) = controller.lock() {
-                        controller.timeout_aws_request(&id);
+                        match unanswered {
+                            Unanswered::TimedOut => controller.timeout_aws_request(&id),
+                            Unanswered::Abandoned => controller.withdraw_aws_request(&id),
+                        }
                     }
                     notify();
                     return Err("AWS credential request denied or timed out".into());
@@ -521,5 +569,48 @@ mod tests {
         assert!(constant_time_equal("abc", "abc"));
         assert!(!constant_time_equal("abc", "abd"));
         assert!(!constant_time_equal("abc", "abcx"));
+    }
+
+    #[test]
+    fn waiting_stops_when_the_requester_exits_or_is_orphaned() {
+        let exited = ProcessIdentity {
+            pid: u32::MAX,
+            ppid: 1,
+            started_at: "start".into(),
+            executable: "/usr/local/bin/aws".into(),
+            command: "aws".into(),
+        };
+        // It asked under a parent it no longer runs under, as if that parent had exited.
+        let mut orphaned = inspect_process_tree(std::process::id(), 1)
+            .unwrap()
+            .remove(0);
+        orphaned.ppid = u32::MAX;
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+
+        // Each check follows a timed-out receive, so even a short wait reports it as abandoned.
+        for requester in [exited, orphaned] {
+            assert!(matches!(
+                wait_for_answer(&receiver, &requester, Duration::from_millis(50)),
+                Err(Unanswered::Abandoned)
+            ));
+        }
+    }
+
+    #[test]
+    fn waiting_on_a_running_process_returns_the_answer_or_times_out() {
+        let running = inspect_process_tree(std::process::id(), 1)
+            .unwrap()
+            .remove(0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        assert!(matches!(
+            wait_for_answer(&receiver, &running, Duration::from_millis(50)),
+            Err(Unanswered::TimedOut)
+        ));
+        sender.send("answer").unwrap();
+        assert!(matches!(
+            wait_for_answer(&receiver, &running, REQUEST_TIMEOUT),
+            Ok("answer")
+        ));
     }
 }

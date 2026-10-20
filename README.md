@@ -73,13 +73,18 @@ region = ca-central-1
 ```
 
 4. Run tools normally. When a process asks for a configured profile, secretd opens a compact,
-   independent approval window with its verified process tree and asks whether to deny the request
-   or grant read-only or admin credentials. The approval window closes after the decision. If the
-   access token has expired, secretd renews it silently using its saved refresh token. Only when the
-   session can no longer be renewed does it open your browser for sign-in, then resume the original
-   credential request. **Refresh** and `secretd aws login` also reuse or renew the saved session before
-   requesting browser sign-in, and rediscover the available accounts and roles. Network failures and
-   temporary AWS errors preserve the saved session and report an error instead of starting a login.
+   independent approval window without taking keyboard focus. It lists every waiting request.
+   The oldest is ticked and shows its verified process tree, so it can be denied or granted read-only
+   or admin credentials. Tick several requests to answer them together; the tree then offers only
+   the processes they all run under. A verified process that asks again while it waits is shown
+   once and shares the answer.
+   The window closes when nothing is waiting, and closing it denies the requests it shows, once.
+   If the access token has expired, secretd renews it silently using its saved refresh token. Only
+   when the session can no longer be renewed does it open your browser for sign-in, then resume the
+   original credential request. **Refresh** and `secretd aws login` also reuse or renew the saved
+   session before requesting browser sign-in, and rediscover the available accounts and roles.
+   Network failures and temporary AWS errors preserve the saved session and report an error instead
+   of starting a login.
 
 The browser flow can reuse an existing browser sign-in when available. AWS or your identity provider
 may still require authentication or consent when the underlying SSO session ends. Session duration
@@ -97,20 +102,21 @@ The selected role is pinned to the chosen process boundary and its children. New
 the active-access screen (up to 60 minutes remaining). A later Terraform invocation does not reuse
 the grant unless it is still a descendant of the selected live process boundary. Already-issued AWS
 role credentials remain usable until their AWS-provided expiration time; revoking or expiring a
-grant prevents secretd from issuing another set automatically. A denial is remembered for 30 minutes
-for the selected verified process boundary and profile.
-Unanswered requests use the requesting process as the boundary. Selecting a parent applies the grant
-or block to its children and immediately resolves their pending requests for that profile, closing
-the approval window when no requests remain. This prevents retry loops from repeatedly opening
-approval windows. Active grants and remembered denials appear under
-**Grants**, where they can be revoked or unblocked immediately.
+grant prevents secretd from issuing another set automatically. A denial is remembered for 30
+minutes for the chosen process, its children and the profile; to stop a script that keeps retrying,
+deny the script rather than one of its commands. An unanswered request blocks only the process that
+asked and its children. A grant or denial also answers the waiting requests it covers. A request
+whose process exits or is orphaned before it is answered, for example because a script's own timeout
+killed it or the shell that ran it, is dropped without a denial. Active grants and remembered
+denials appear under **Grants**, where they can be revoked or unblocked immediately.
 
 On **Grants**, AWS access can be switched between read-only and admin without changing the process
 boundary or expiration. The selected role applies to future credential requests. Credentials already
 issued by AWS remain usable until their expiration.
 
 Temporary secret grants also resolve pending requests for the same secret within the selected
-process boundary. Allow once and closing the approval window affect only the current request.
+process boundary. Allow once answers only the selected requests; closing the approval window
+dismisses only the requests it displays.
 
 The generic secret vault and `get` request remain compatible with the Deno implementation. Vaults
 that contain the Rust application's AWS extension require an AWS-aware secretd version.

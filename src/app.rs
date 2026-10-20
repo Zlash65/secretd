@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     error::Error,
     sync::{Arc, Mutex, mpsc::Sender},
     time::{Duration, Instant},
@@ -10,6 +10,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT,
     TitleBar,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -32,10 +33,7 @@ use zeroize::Zeroizing;
 
 use secretd::{
     aws::{AwsAccessLevel, AwsConfiguration, AwsLoginStatus, AwsSettingsSummary, AwsTarget},
-    controller::{
-        AppSnapshot, ApprovalDecision, AuditAction, Controller, PendingAwsCredentialRequest,
-        PendingRequest,
-    },
+    controller::{AppSnapshot, ApprovalDecision, AuditAction, AwsDecision, Controller},
     grants::DEFAULT_GRANT_SECONDS,
     ipc::{RequestServer, begin_aws_login},
     paths::{default_runtime_path, default_vault_path},
@@ -227,7 +225,7 @@ struct Toast {
     expires_at: Instant,
 }
 
-/// The actions and body of a main-window page or an access request.
+/// The actions and body of a main-window page.
 struct PageContent {
     actions: Option<gpui_kit::AnyElement>,
     body: gpui_kit::AnyElement,
@@ -1574,7 +1572,7 @@ impl MainView {
                             .child(rows_panel(palette, blocked))
                             .child(footnote(
                                 palette,
-                                "secretd won't ask about a denied process again for 30 minutes. Unblock it to be asked on its next request.",
+                                "secretd won't ask a blocked process or its children again for 30 minutes. Unblock it to be asked on its next request.",
                             )),
                     ))
                 })
@@ -2029,7 +2027,15 @@ impl Render for MainView {
 pub struct RequestView {
     focus_handle: FocusHandle,
     error: Option<String>,
-    grant_process_choices: HashMap<String, ProcessIdentity>,
+    /// The requests the buttons answer, all of one kind. Only the oldest is ticked for the user,
+    /// when the window opens, so a fast second click can't answer a request that just appeared.
+    ticked: HashSet<String>,
+    /// Requests showing their full command and parent processes.
+    expanded: HashSet<String>,
+    /// The process the answer applies to. `None` means each ticked request's own process.
+    chosen: Option<ProcessIdentity>,
+    /// The requests on screen. Dismissing affects only these, not ones that arrived since.
+    shown: Vec<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -2037,18 +2043,36 @@ impl RequestView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Tab can't start from nothing, so focus the window once it is drawn. Focusing the
         // window rather than a control keeps Enter and Space from choosing a grant boundary or
-        // an answer by accident. Answer buttons are keyed by request, so answering one removes
-        // it and focus comes back here rather than moving to the next request's buttons.
+        // an answer by accident. Answer buttons are keyed by the ticked requests, so answering
+        // them removes the buttons and focus comes back here.
         cx.defer_in(window, |this, window, cx| {
             this.focus_handle.focus(window, cx)
         });
         let _subscriptions = vec![cx.on_focus_lost(window, |this, window, cx| {
             this.focus_handle.focus(window, cx)
         })];
+        // Closing the window dismisses the requests it shows.
+        let view = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            if let Some(view) = view.upgrade() {
+                let shown = view.read(cx).shown.clone();
+                dismiss_requests(&shown, cx);
+            }
+            true
+        });
+        let snapshot = Self::snapshot(cx);
+        let oldest: HashSet<_> = waiting_requests(&snapshot)
+            .first()
+            .map(|request| request.id.to_string())
+            .into_iter()
+            .collect();
         Self {
             focus_handle: cx.focus_handle(),
             error: None,
-            grant_process_choices: HashMap::new(),
+            ticked: oldest.clone(),
+            expanded: oldest,
+            chosen: None,
+            shown: Vec::new(),
             _subscriptions,
         }
     }
@@ -2057,11 +2081,55 @@ impl RequestView {
         cx.global::<AppState>().snapshot()
     }
 
-    fn respond_secret(
+    fn set_ticked(&mut self, ticked: HashSet<String>, cx: &mut Context<Self>) {
+        self.ticked = ticked;
+        self.error = None;
+        cx.notify();
+    }
+
+    fn toggle_ticked(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.ticked.remove(&id) {
+            self.ticked.insert(id);
+        }
+        self.error = None;
+        cx.notify();
+    }
+
+    fn toggle_expanded(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&id) {
+            self.expanded.insert(id);
+        }
+        cx.notify();
+    }
+
+    fn choose_process(&mut self, process: Option<ProcessIdentity>, cx: &mut Context<Self>) {
+        self.chosen = process;
+        cx.notify();
+    }
+
+    fn answer_aws(
         &mut self,
-        id: String,
+        answers: Vec<(String, Option<ProcessIdentity>)>,
+        decision: AwsDecision,
+        cx: &mut Context<Self>,
+    ) {
+        let result = cx
+            .global::<AppState>()
+            .controller()
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())
+            .and_then(|mut controller| {
+                controller
+                    .respond_aws_batch(&answers, decision, Some(DEFAULT_GRANT_SECONDS))
+                    .map_err(|error| error.to_string())
+            });
+        self.answered(result, cx);
+    }
+
+    fn answer_secrets(
+        &mut self,
+        answers: Vec<(String, Option<ProcessIdentity>)>,
         decision: ApprovalDecision,
-        process: Option<ProcessIdentity>,
         cx: &mut Context<Self>,
     ) {
         let seconds = (decision == ApprovalDecision::Temporary).then_some(DEFAULT_GRANT_SECONDS);
@@ -2072,274 +2140,20 @@ impl RequestView {
             .map_err(|_| "secretd state is unavailable".to_string())
             .and_then(|mut controller| {
                 controller
-                    .respond(&id, decision, seconds, process)
+                    .respond_batch(&answers, decision, seconds)
                     .map_err(|error| error.to_string())
             });
+        self.answered(result, cx);
+    }
+
+    fn answered(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
         if result.is_ok() {
-            self.grant_process_choices.remove(&id);
+            self.ticked.clear();
+            self.chosen = None;
         }
         self.error = result.err();
         (cx.global::<AppState>().notify())();
         cx.notify();
-    }
-
-    fn respond_aws(
-        &mut self,
-        id: String,
-        level: Option<AwsAccessLevel>,
-        process: Option<ProcessIdentity>,
-        cx: &mut Context<Self>,
-    ) {
-        let result = cx
-            .global::<AppState>()
-            .controller()
-            .lock()
-            .map_err(|_| "secretd state is unavailable".to_string())
-            .and_then(|mut controller| {
-                controller
-                    .respond_aws(&id, level, process, Some(DEFAULT_GRANT_SECONDS))
-                    .map_err(|error| error.to_string())
-            });
-        if result.is_ok() {
-            self.grant_process_choices.remove(&id);
-        }
-        self.error = result.err();
-        (cx.global::<AppState>().notify())();
-        cx.notify();
-    }
-
-    fn select_grant_process(
-        &mut self,
-        request_id: String,
-        process: ProcessIdentity,
-        cx: &mut Context<Self>,
-    ) {
-        self.grant_process_choices.insert(request_id, process);
-        cx.notify();
-    }
-
-    fn grant_process(
-        &self,
-        request_id: &str,
-        process_tree: &[ProcessIdentity],
-    ) -> Option<ProcessIdentity> {
-        self.grant_process_choices
-            .get(request_id)
-            .filter(|selected| {
-                process_tree
-                    .iter()
-                    .any(|process| same_process(selected, process))
-            })
-            .cloned()
-            .or_else(|| default_grant_process(process_tree))
-    }
-
-    fn render_secret(
-        &self,
-        request: &PendingRequest,
-        unlocked: bool,
-        palette: Palette,
-        cx: &mut Context<Self>,
-    ) -> PageContent {
-        let entity = cx.entity();
-        let mono = cx.theme().mono_font_family.clone();
-        let process = self.grant_process(&request.id, &request.process_tree);
-        let deny_id = request.id.clone();
-        let once_id = request.id.clone();
-        let grant_id = request.id.clone();
-        let body = v_flex()
-            .gap_6()
-            .child(request_header(
-                palette,
-                IconName::KeyRound,
-                "Secret requested",
-                div().font_family(mono).child(request.secret.clone()),
-                request.verified,
-            ))
-            .child(process_grant_selector(
-                palette,
-                &request.id,
-                &request.process_tree,
-                process.as_ref(),
-                request.verified,
-                entity.clone(),
-            ))
-            .into_any_element();
-        let actions = h_flex()
-            .gap_2()
-            .child(
-                Button::new(SharedString::from(format!("deny-secret-{}", request.id)))
-                    .outline()
-                    .label("Deny")
-                    .on_click({
-                        let entity = entity.clone();
-                        move |_, _, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.respond_secret(
-                                    deny_id.clone(),
-                                    ApprovalDecision::Deny,
-                                    None,
-                                    cx,
-                                )
-                            });
-                        }
-                    }),
-            )
-            .when(unlocked, |this| {
-                this.child(
-                    Button::new(SharedString::from(format!("once-secret-{}", request.id)))
-                        .outline()
-                        .label("Allow once")
-                        .on_click({
-                            let entity = entity.clone();
-                            move |_, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.respond_secret(
-                                        once_id.clone(),
-                                        ApprovalDecision::Once,
-                                        None,
-                                        cx,
-                                    )
-                                });
-                            }
-                        }),
-                )
-            })
-            .when(unlocked && request.verified, |this| {
-                this.child(
-                    Button::new(SharedString::from(format!("grant-secret-{}", request.id)))
-                        .primary()
-                        .label("Grant for 30 minutes")
-                        .on_click(move |_, _, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.respond_secret(
-                                    grant_id.clone(),
-                                    ApprovalDecision::Temporary,
-                                    process.clone(),
-                                    cx,
-                                )
-                            });
-                        }),
-                )
-            })
-            .when(!unlocked, |this| {
-                this.child(
-                    Button::new("unlock-main")
-                        .primary()
-                        .label("Open secretd to unlock")
-                        .on_click(|_, _, cx| crate::runtime::open_main(cx)),
-                )
-            })
-            .into_any_element();
-        PageContent {
-            actions: Some(actions),
-            body,
-        }
-    }
-
-    fn render_aws_request(
-        &self,
-        request: &PendingAwsCredentialRequest,
-        unlocked: bool,
-        palette: Palette,
-        cx: &mut Context<Self>,
-    ) -> PageContent {
-        let entity = cx.entity();
-        let mono = cx.theme().mono_font_family.clone();
-        let process = self.grant_process(&request.id, &request.process_tree);
-        let deny_id = request.id.clone();
-        let read_id = request.id.clone();
-        let admin_id = request.id.clone();
-        let body = v_flex()
-            .gap_6()
-            .child(request_header(
-                palette,
-                IconName::Cloud,
-                "AWS credentials requested",
-                h_flex()
-                    .gap_1p5()
-                    .child(div().text_color(rgb(palette.muted)).child("Profile"))
-                    .child(div().font_family(mono).child(request.profile.clone())),
-                request.verified,
-            ))
-            .child(process_grant_selector(
-                palette,
-                &request.id,
-                &request.process_tree,
-                process.as_ref(),
-                request.verified,
-                entity.clone(),
-            ))
-            .into_any_element();
-        let actions = h_flex()
-            .gap_2()
-            .child(
-                Button::new(SharedString::from(format!("deny-aws-{}", request.id)))
-                    .outline()
-                    .label(if request.verified {
-                        "Deny for 30 min"
-                    } else {
-                        "Deny"
-                    })
-                    .on_click({
-                        let entity = entity.clone();
-                        let process = process.clone();
-                        move |_, _, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.respond_aws(deny_id.clone(), None, process.clone(), cx)
-                            });
-                        }
-                    }),
-            )
-            .when(unlocked, |this| {
-                this.child(
-                    Button::new(SharedString::from(format!("read-aws-{}", request.id)))
-                        .primary()
-                        .label("Grant read-only")
-                        .on_click({
-                            let entity = entity.clone();
-                            let process = process.clone();
-                            move |_, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.respond_aws(
-                                        read_id.clone(),
-                                        Some(AwsAccessLevel::ReadOnly),
-                                        process.clone(),
-                                        cx,
-                                    )
-                                });
-                            }
-                        }),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("admin-aws-{}", request.id)))
-                        .danger()
-                        .label("Grant admin")
-                        .on_click(move |_, _, cx| {
-                            entity.update(cx, |this, cx| {
-                                this.respond_aws(
-                                    admin_id.clone(),
-                                    Some(AwsAccessLevel::Admin),
-                                    process.clone(),
-                                    cx,
-                                )
-                            });
-                        }),
-                )
-            })
-            .when(!unlocked, |this| {
-                this.child(
-                    Button::new("unlock-main")
-                        .primary()
-                        .label("Open secretd to unlock")
-                        .on_click(|_, _, cx| crate::runtime::open_main(cx)),
-                )
-            })
-            .into_any_element();
-        PageContent {
-            actions: Some(actions),
-            body,
-        }
     }
 }
 
@@ -2347,33 +2161,497 @@ impl Render for RequestView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snapshot = Self::snapshot(cx);
         let palette = Palette::current(cx);
-        let show_aws = match (snapshot.pending_aws.first(), snapshot.pending.first()) {
-            (Some(aws), Some(secret)) => aws.requested_at <= secret.requested_at,
-            (Some(_), None) => true,
-            _ => false,
+        let mono = cx.theme().mono_font_family.clone();
+        let entity = cx.entity();
+        let requests = waiting_requests(&snapshot);
+        self.shown = requests
+            .iter()
+            .map(|request| request.id.to_string())
+            .collect();
+        // Forget requests that were answered or withdrawn. Nothing is ticked in their place.
+        let waiting = |id: &String| requests.iter().any(|request| request.id == id);
+        self.ticked.retain(waiting);
+        self.expanded.retain(waiting);
+        let ticked: Vec<_> = requests
+            .iter()
+            .filter(|request| self.ticked.contains(request.id))
+            .collect();
+        let trees: Vec<_> = ticked.iter().map(|request| request.process_tree).collect();
+        let options = shared_processes(&trees);
+        // A chosen process stays only while it covers every ticked request, so ticking more
+        // never widens an answer.
+        if self
+            .chosen
+            .as_ref()
+            .is_some_and(|chosen| !options.iter().any(|option| same_process(option, chosen)))
+        {
+            self.chosen = None;
+        }
+        let aws = ticked.first().map(|request| request.aws);
+        let verified = ticked.iter().all(|request| request.verified);
+        // Unticked requests the answer settles too: the same kind and resource as a ticked
+        // request, running under the process its answer applies to.
+        let covered: HashSet<&str> = requests
+            .iter()
+            .filter(|request| {
+                verified
+                    && request.verified
+                    && !self.ticked.contains(request.id)
+                    && ticked.iter().any(|answered| {
+                        let boundary = self.chosen.as_ref().unwrap_or(answered.origin);
+                        answered.aws == request.aws
+                            && answered.resource == request.resource
+                            && request
+                                .process_tree
+                                .iter()
+                                .any(|process| same_process(process, boundary))
+                    })
+            })
+            .map(|request| request.id)
+            .collect();
+
+        let kind = aws.or_else(|| requests.first().map(|request| request.aws));
+        let selectable: HashSet<String> = requests
+            .iter()
+            .filter(|request| Some(request.aws) == kind && request.verified)
+            .map(|request| request.id.to_string())
+            .collect();
+        let title = match (
+            requests.iter().any(|request| request.aws),
+            requests.iter().any(|request| !request.aws),
+        ) {
+            (true, false) => "AWS credentials requested",
+            (false, true) => "Secrets requested",
+            _ => "Access requested",
         };
-        let request = if show_aws {
-            snapshot
-                .pending_aws
-                .first()
-                .map(|request| self.render_aws_request(request, snapshot.unlocked, palette, cx))
+        let header = h_flex()
+            .items_end()
+            .gap_2()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .gap_0p5()
+                    .child(div().text_size(px(17.)).font_semibold().child(title))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(palette.muted))
+                            .child(format!("{} waiting", requests.len())),
+                    ),
+            )
+            .when(selectable.len() > 1 && selectable != self.ticked, |this| {
+                let entity = entity.clone();
+                let label = format!("Select all ({})", selectable.len());
+                this.child(
+                    Button::new("select-all")
+                        .ghost()
+                        .small()
+                        .label(label)
+                        .on_click(move |event, _, cx| {
+                            if event.click_count() == 1 {
+                                entity
+                                    .update(cx, |this, cx| this.set_ticked(selectable.clone(), cx));
+                            }
+                        }),
+                )
+            })
+            .when(!self.ticked.is_empty(), |this| {
+                let entity = entity.clone();
+                this.child(
+                    Button::new("clear-ticks")
+                        .ghost()
+                        .small()
+                        .label("Clear")
+                        .on_click(move |event, _, cx| {
+                            if event.click_count() == 1 {
+                                entity.update(cx, |this, cx| this.set_ticked(HashSet::new(), cx));
+                            }
+                        }),
+                )
+            });
+
+        let rows = requests
+            .iter()
+            .map(|request| {
+                let id = request.id.to_string();
+                let is_ticked = self.ticked.contains(request.id);
+                let is_expanded = self.expanded.contains(request.id);
+                let blocked = match aws {
+                    Some(_) if is_ticked => None,
+                    Some(aws) if aws != request.aws => {
+                        Some("Answer AWS and secret requests separately.")
+                    }
+                    Some(_) if !verified || !request.verified => {
+                        Some("Unverified requests are answered one at a time.")
+                    }
+                    _ => None,
+                };
+                let mut summary = format!(
+                    "{} · PID {}",
+                    compact_process_label(request.origin),
+                    request.origin.pid
+                );
+                if !is_expanded
+                    && let Some(parent) = request
+                        .process_tree
+                        .get(1)
+                        .filter(|process| !is_launchd_process(process))
+                {
+                    summary.push_str(&format!(" · via {}", compact_process_label(parent)));
+                }
+                if request.asks > 1 {
+                    summary.push_str(&format!(" · asked {} times", request.asks));
+                }
+                let tick_entity = entity.clone();
+                let tick_id = id.clone();
+                let disclose_entity = entity.clone();
+                let disclose_id = id.clone();
+                let expand_entity = entity.clone();
+                v_flex()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .when(is_ticked, |row| row.bg(rgb(palette.accent_soft)))
+                    .child(
+                        h_flex()
+                            .gap_2p5()
+                            .child(
+                                Checkbox::new(SharedString::from(format!("tick-{id}")))
+                                    .checked(is_ticked)
+                                    .disabled(blocked.is_some())
+                                    .when_some(blocked, |checkbox, reason| checkbox.tooltip(reason))
+                                    .accessibility_label(format!("Answer {}", request.resource))
+                                    .on_click(move |_, _, cx| {
+                                        tick_entity.update(cx, |this, cx| {
+                                            this.toggle_ticked(tick_id.clone(), cx)
+                                        });
+                                    }),
+                            )
+                            // A button, so the keyboard can open the details too. The rest of the
+                            // row toggles them on click.
+                            .child(
+                                Button::new(SharedString::from(format!("details-{id}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip(process_details(request.origin))
+                                    .icon(if is_expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .accessibility_label(if is_expanded {
+                                        "Hide details"
+                                    } else {
+                                        "Show details"
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        disclose_entity.update(cx, |this, cx| {
+                                            this.toggle_expanded(disclose_id.clone(), cx)
+                                        });
+                                    }),
+                            )
+                            .child(
+                                h_flex()
+                                    .id(SharedString::from(format!("expand-{id}")))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_2()
+                                    .cursor_pointer()
+                                    .on_click(move |_, _, cx| {
+                                        expand_entity.update(cx, |this, cx| {
+                                            this.toggle_expanded(id.clone(), cx)
+                                        });
+                                    })
+                                    .child(
+                                        Icon::new(if request.aws {
+                                            IconName::Cloud
+                                        } else {
+                                            IconName::KeyRound
+                                        })
+                                        .size(px(16.))
+                                        .text_color(rgb(palette.muted)),
+                                    )
+                                    .child(
+                                        // Wraps a long name instead of pushing the requester out.
+                                        div()
+                                            .min_w_0()
+                                            .max_w(relative(0.5))
+                                            .font_family(mono.clone())
+                                            .text_size(px(13.))
+                                            .font_semibold()
+                                            .child(request.resource.to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(palette.muted))
+                                            .child(summary),
+                                    ),
+                            )
+                            .when(!request.verified, |row| {
+                                row.child(tag("Unverified", palette.amber, palette.amber_soft))
+                            })
+                            .when(covered.contains(request.id), |row| {
+                                row.child(tag("Covered", palette.amber, palette.amber_soft))
+                            })
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(palette.muted))
+                                    .child(duration_since(request.requested_at)),
+                            ),
+                    )
+                    .when(is_expanded, |row| {
+                        row.child(request_details(palette, mono.clone(), request))
+                    })
+            })
+            .collect();
+
+        let decision = if ticked.is_empty() {
+            footnote(palette, "Tick a request to answer it.")
         } else {
-            snapshot
-                .pending
-                .first()
-                .map(|request| self.render_secret(request, snapshot.unlocked, palette, cx))
+            let selected = if ticked.len() == 1 {
+                self.chosen
+                    .clone()
+                    .or_else(|| default_grant_process(ticked[0].process_tree))
+            } else {
+                self.chosen.clone()
+            };
+            let mut resources: Vec<&str> = Vec::new();
+            for request in &ticked {
+                if !resources.contains(&request.resource) {
+                    resources.push(request.resource);
+                }
+            }
+            let resources = resources.join(", ");
+            let mut summary = match (&self.chosen, ticked.as_slice()) {
+                (None, [request]) => {
+                    let mut text = format!(
+                        "Access will follow {} and its child processes.",
+                        compact_process_label(request.origin)
+                    );
+                    if let Some(parent) = options.iter().rev().nth(1) {
+                        text.push_str(&format!(
+                            " A grant on the requester ends when it exits. Choose {} to cover what it runs next.",
+                            compact_process_label(parent)
+                        ));
+                    }
+                    text
+                }
+                (Some(process), [_]) => format!(
+                    "Access will follow {} and its child processes.",
+                    compact_process_label(process)
+                ),
+                (Some(process), _) => format!(
+                    "Access will follow {} and its child processes, for {resources}.",
+                    compact_process_label(process)
+                ),
+                (None, _) => format!(
+                    "Access will follow each requesting process, for {resources}. Grants on requesters end when they exit."
+                ),
+            };
+            if !covered.is_empty() {
+                summary.push_str(&format!(
+                    " {} {} waiting request{} you didn't tick.",
+                    if aws == Some(true) {
+                        "Also answers"
+                    } else {
+                        "Granting also answers"
+                    },
+                    covered.len(),
+                    if covered.len() == 1 { "" } else { "s" }
+                ));
+            }
+            v_flex()
+                .gap_2()
+                .child(boundary_tree(
+                    palette,
+                    &options,
+                    selected.as_ref(),
+                    ticked.len(),
+                    verified,
+                    entity.clone(),
+                ))
+                .when(verified, |this| this.child(footnote(palette, &summary)))
+                .into_any_element()
         };
-        let (body, actions) = match request {
-            Some(PageContent { actions, body }) => (Some(body), actions),
-            None => (None, None),
+
+        // Buttons are keyed by the ticked requests, so a click can't land on a newer selection.
+        let key = ticked
+            .iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>()
+            .join(",");
+        let answers: Vec<_> = ticked
+            .iter()
+            .map(|request| (request.id.to_string(), self.chosen.clone()))
+            .collect();
+        let count = |answered: usize| {
+            if answered > 1 {
+                format!(" ({answered})")
+            } else {
+                String::new()
+            }
         };
-        let waiting = (snapshot.pending.len() + snapshot.pending_aws.len()).saturating_sub(1);
+        let settled = ticked.len() + covered.len();
+        let unlocked = snapshot.unlocked;
+        let actions = match aws {
+            None => None,
+            Some(true) => Some(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!("deny-{key}")))
+                            .outline()
+                            .label(if verified {
+                                format!("Deny for 30 min{}", count(settled))
+                            } else {
+                                "Deny".to_string()
+                            })
+                            .on_click({
+                                let entity = entity.clone();
+                                let answers = answers.clone();
+                                move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.answer_aws(answers.clone(), AwsDecision::Deny, cx)
+                                    });
+                                }
+                            }),
+                    )
+                    .when(unlocked, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!("read-{key}")))
+                                .primary()
+                                .label(format!("Grant read-only{}", count(settled)))
+                                .on_click({
+                                    let entity = entity.clone();
+                                    let answers = answers.clone();
+                                    move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.answer_aws(
+                                                answers.clone(),
+                                                AwsDecision::Grant(AwsAccessLevel::ReadOnly),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("admin-{key}")))
+                                .danger()
+                                .label(format!("Grant admin{}", count(settled)))
+                                .on_click({
+                                    let entity = entity.clone();
+                                    let answers = answers.clone();
+                                    move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.answer_aws(
+                                                answers.clone(),
+                                                AwsDecision::Grant(AwsAccessLevel::Admin),
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                        )
+                    }),
+            ),
+            Some(false) => Some(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new(SharedString::from(format!("deny-{key}")))
+                            .outline()
+                            .label(format!("Deny{}", count(ticked.len())))
+                            .on_click({
+                                let entity = entity.clone();
+                                let answers = answers.clone();
+                                move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.answer_secrets(
+                                            answers.clone(),
+                                            ApprovalDecision::Deny,
+                                            cx,
+                                        )
+                                    });
+                                }
+                            }),
+                    )
+                    .when(unlocked, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!("once-{key}")))
+                                .outline()
+                                .label(format!("Allow once{}", count(ticked.len())))
+                                .on_click({
+                                    let entity = entity.clone();
+                                    let answers = answers.clone();
+                                    move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.answer_secrets(
+                                                answers.clone(),
+                                                ApprovalDecision::Once,
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                        )
+                    })
+                    .when(unlocked && verified, |this| {
+                        this.child(
+                            Button::new(SharedString::from(format!("grant-{key}")))
+                                .primary()
+                                .label(format!("Grant for 30 minutes{}", count(settled)))
+                                .on_click({
+                                    let entity = entity.clone();
+                                    let answers = answers.clone();
+                                    move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.answer_secrets(
+                                                answers.clone(),
+                                                ApprovalDecision::Temporary,
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                }),
+                        )
+                    }),
+            ),
+        }
+        .map(|actions| {
+            actions.when(!unlocked, |this| {
+                this.child(
+                    Button::new("unlock-main")
+                        .primary()
+                        .label("Open secretd to unlock")
+                        .on_click(|_, _, cx| crate::runtime::open_main(cx)),
+                )
+            })
+        });
+
         v_flex()
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(rgb(palette.background))
             .text_color(rgb(palette.ink))
-            .child(window_bar(palette, Some("secretd · Access request")))
+            .child(
+                window_bar(palette, Some("secretd · Access requests")).on_close_window({
+                    // Linux draws the close button itself, and it skips the window's should-close
+                    // check, so the shown requests are dismissed here instead.
+                    let shown = self.shown.clone();
+                    move |_, window, cx| {
+                        dismiss_requests(&shown, cx);
+                        window.remove_window();
+                    }
+                }),
+            )
             .child(
                 v_flex()
                     .id("request-content")
@@ -2386,54 +2664,53 @@ impl Render for RequestView {
                     .when_some(self.error.clone(), |this, error| {
                         this.child(error_banner(palette, error))
                     })
-                    .children(body),
+                    .child(header)
+                    .child(rows_panel(palette, rows))
+                    .child(decision),
             )
-            .when_some(actions, |this, actions| {
-                this.child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .gap_4()
-                        .px_6()
-                        .py_4()
-                        .border_t_1()
-                        .border_color(rgb(palette.line))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(12.))
-                                .text_color(rgb(palette.muted))
-                                .when(waiting > 0, |this| {
-                                    this.child(format!(
-                                        "{waiting} more request{} waiting",
-                                        if waiting == 1 { "" } else { "s" }
-                                    ))
-                                }),
-                        )
-                        .child(actions),
-                )
-            })
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .px_6()
+                    .py_4()
+                    .border_t_1()
+                    .border_color(rgb(palette.line))
+                    .child(
+                        // Keyed by the requests it dismisses, so a click can't land on a newer
+                        // list. The second click of a double-click is skipped: it lands after the
+                        // list refreshes, on requests nobody has read.
+                        Button::new(SharedString::from(format!(
+                            "dismiss-{}",
+                            self.shown.join(",")
+                        )))
+                        .ghost()
+                        .label("Dismiss all")
+                        .tooltip("Deny every waiting request, this time only")
+                        .on_click({
+                            let shown = self.shown.clone();
+                            move |event, _, cx| {
+                                if event.click_count() == 1 {
+                                    dismiss_requests(&shown, cx);
+                                }
+                            }
+                        }),
+                    )
+                    .child(div().flex_1())
+                    .children(actions),
+            )
             .into_any_element()
     }
 }
 
-pub fn dismiss_oldest_request(cx: &mut App) {
-    let snapshot = cx.global::<AppState>().snapshot();
-    let deny_aws = match (snapshot.pending_aws.first(), snapshot.pending.first()) {
-        (Some(aws), Some(secret)) => aws.requested_at <= secret.requested_at,
-        (Some(_), None) => true,
-        _ => false,
-    };
+/// Denies these requests once, without the 30-minute block.
+fn dismiss_requests(ids: &[String], cx: &mut App) {
+    let answers: Vec<_> = ids.iter().map(|id| (id.clone(), None)).collect();
     let controller = cx.global::<AppState>().controller();
-    if deny_aws {
-        if let Some(request) = snapshot.pending_aws.first()
-            && let Ok(mut controller) = controller.lock()
-        {
-            let _ = controller.dismiss_aws_request(&request.id);
-        }
-    } else if let Some(request) = snapshot.pending.first()
-        && let Ok(mut controller) = controller.lock()
-    {
-        let _ = controller.respond(&request.id, ApprovalDecision::Deny, None, None);
+    if let Ok(mut controller) = controller.lock() {
+        // Each kind skips the other's requests, and both skip ones already answered.
+        let _ = controller.respond_aws_batch(&answers, AwsDecision::Dismiss, None);
+        let _ = controller.respond_batch(&answers, ApprovalDecision::Deny, None);
     }
     (cx.global::<AppState>().notify())();
 }
@@ -2449,7 +2726,7 @@ fn page_title(page: Page) -> &'static str {
 
 /// The standard title bar: a full-width strip that holds the window controls and drags the window.
 /// The system doesn't draw the window's title, so a window that needs one shows `title` here.
-fn window_bar(palette: Palette, title: Option<&'static str>) -> gpui_kit::AnyElement {
+fn window_bar(palette: Palette, title: Option<&'static str>) -> TitleBar {
     TitleBar::new()
         .bg(rgb(palette.sidebar))
         .border_color(rgb(palette.line))
@@ -2460,7 +2737,6 @@ fn window_bar(palette: Palette, title: Option<&'static str>) -> gpui_kit::AnyEle
                 .text_color(rgb(palette.muted))
                 .child(title)
         }))
-        .into_any_element()
 }
 
 fn page_header(title: &'static str, actions: Option<gpui_kit::AnyElement>) -> gpui_kit::AnyElement {
@@ -2791,10 +3067,7 @@ fn translucent(color: u32, alpha: u8) -> gpui_kit::Rgba {
     rgba((color << 8) | u32::from(alpha))
 }
 
-fn aws_login_banner(
-    status: &AwsLoginStatus,
-    palette: Palette,
-) -> Option<gpui_kit::AnyElement> {
+fn aws_login_banner(status: &AwsLoginStatus, palette: Palette) -> Option<gpui_kit::AnyElement> {
     match status {
         AwsLoginStatus::Starting => Some(progress_banner(palette, "Checking AWS session…")),
         AwsLoginStatus::Discovering => Some(progress_banner(
@@ -2966,45 +3239,6 @@ fn action_button(
     })
 }
 
-fn request_header(
-    palette: Palette,
-    icon: IconName,
-    title: &str,
-    subject: impl IntoElement,
-    verified: bool,
-) -> gpui_kit::AnyElement {
-    h_flex()
-        .items_start()
-        .gap_4()
-        .child(icon_tile(icon, 44., palette.accent, palette.accent_soft))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(
-                    div()
-                        .text_size(px(17.))
-                        .font_semibold()
-                        .child(title.to_string()),
-                )
-                .child(
-                    // Wraps, so a long name moves the tag to its own line instead of off-screen.
-                    h_flex()
-                        .flex_wrap()
-                        .gap_x_2()
-                        .gap_y_1()
-                        .child(div().min_w_0().child(subject))
-                        .child(if verified {
-                            tag("Verified process", palette.green, palette.green_soft)
-                        } else {
-                            tag("Unverified process", palette.amber, palette.amber_soft)
-                        }),
-                ),
-        )
-        .into_any_element()
-}
-
 fn toast_view(palette: Palette, toast: &Toast) -> gpui_kit::AnyElement {
     div()
         .absolute()
@@ -3075,22 +3309,19 @@ fn modal_actions(
         .into_any_element()
 }
 
-fn process_grant_selector(
+/// The processes an answer can apply to, top first, as radio buttons. One ticked request ends with
+/// its requester. Several end with an option that keeps each request on its own process.
+fn boundary_tree(
     palette: Palette,
-    request_id: &str,
     processes: &[ProcessIdentity],
     selected: Option<&ProcessIdentity>,
+    ticked: usize,
     enabled: bool,
     entity: Entity<RequestView>,
 ) -> gpui_kit::AnyElement {
-    let grantable = processes
-        .iter()
-        .filter(|process| !is_launchd_process(process))
-        .rev()
-        .collect::<Vec<_>>();
-    let requester = processes
-        .iter()
-        .find(|process| !is_launchd_process(process));
+    let several = ticked > 1;
+    let deepest = processes.len().saturating_sub(1);
+    let each_entity = entity.clone();
     v_flex()
         .gap_2()
         .child(
@@ -3101,10 +3332,10 @@ fn process_grant_selector(
                     div()
                         .text_size(px(13.))
                         .font_semibold()
-                        .child(if enabled {
-                            "Process boundary"
-                        } else {
-                            "Requesting process"
+                        .child(match (enabled, several) {
+                            (false, _) => "Requesting process".to_string(),
+                            (true, false) => "Process boundary".to_string(),
+                            (true, true) => format!("Process boundary · {ticked} selected"),
                         }),
                 )
                 .child(
@@ -3112,7 +3343,7 @@ fn process_grant_selector(
                         .text_size(px(12.))
                         .text_color(rgb(palette.muted))
                         .child(if enabled {
-                            "Choose a process to include its child processes."
+                            "Choose which process and its children this decision applies to."
                         } else {
                             "This process could not be verified, so access can only be allowed once."
                         }),
@@ -3122,15 +3353,12 @@ fn process_grant_selector(
             panel(palette)
                 .py_2()
                 .gap_1()
-                .children(grantable.into_iter().enumerate().map(|(depth, process)| {
+                .children(processes.iter().enumerate().map(|(depth, process)| {
                     let process = process.clone();
-                    let request_id = request_id.to_string();
-                    let radio_id = format!("grant-process-{request_id}-{}", process.pid);
-                    let is_requester = requester.is_some_and(|value| same_process(value, &process));
+                    let pid = process.pid;
+                    let label = compact_process_label(&process);
+                    let details = process_details(&process);
                     let is_selected = selected.is_some_and(|value| same_process(value, &process));
-                    let process_label = compact_process_label(&process);
-                    let process_details = process_details(&process);
-                    let process_pid = process.pid;
                     let entity = entity.clone();
                     h_flex()
                         .gap_2()
@@ -3138,19 +3366,15 @@ fn process_grant_selector(
                         .pr_3()
                         .py_0p5()
                         .child(
-                            Radio::new(radio_id)
+                            Radio::new(SharedString::from(format!("boundary-{pid}")))
                                 .checked(is_selected)
                                 .disabled(!enabled)
-                                .label(process_label)
-                                .tooltip(process_details)
+                                .label(label)
+                                .tooltip(details)
                                 .on_click(move |checked, _, cx| {
                                     if *checked {
                                         entity.update(cx, |this, cx| {
-                                            this.select_grant_process(
-                                                request_id.clone(),
-                                                process.clone(),
-                                                cx,
-                                            )
+                                            this.choose_process(Some(process.clone()), cx)
                                         });
                                     }
                                 }),
@@ -3159,26 +3383,138 @@ fn process_grant_selector(
                             div()
                                 .text_size(px(11.))
                                 .text_color(rgb(palette.muted))
-                                .child(format!("PID {process_pid}")),
+                                .child(format!("PID {pid}")),
                         )
-                        .when(is_requester, |this| {
-                            this.child(tag("Requester", palette.green, palette.green_soft))
+                        .when(depth == deepest, |this| {
+                            this.child(if several {
+                                tag(
+                                    &format!("Shared by all {ticked}"),
+                                    palette.accent,
+                                    palette.accent_soft,
+                                )
+                            } else {
+                                tag("Requester", palette.green, palette.green_soft)
+                            })
                         })
-                })),
+                }))
+                .when(several, |this| {
+                    this.child(
+                        h_flex()
+                            .pl(px(12. + processes.len() as f32 * 16.))
+                            .pr_3()
+                            .py_0p5()
+                            .child(
+                                Radio::new("boundary-each")
+                                    .checked(selected.is_none())
+                                    .label("Each requesting process")
+                                    .on_click(move |checked, _, cx| {
+                                        if *checked {
+                                            each_entity
+                                                .update(cx, |this, cx| this.choose_process(None, cx));
+                                        }
+                                    }),
+                            ),
+                    )
+                }),
         )
-        .when_some(selected.filter(|_| enabled), |this, selected| {
-            let name = selected
-                .executable
-                .rsplit('/')
-                .next()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&selected.executable);
-            this.child(footnote(
-                palette,
-                &format!("Selected: {name} and its child processes."),
-            ))
+        .into_any_element()
+}
+
+/// The command and parent processes of a waiting request.
+fn request_details(
+    palette: Palette,
+    mono: SharedString,
+    request: &Waiting,
+) -> gpui_kit::AnyElement {
+    let parents = request
+        .process_tree
+        .iter()
+        .skip(1)
+        .filter(|process| !is_launchd_process(process))
+        .map(compact_process_label)
+        .collect::<Vec<_>>()
+        .join(" › ");
+    // The details button's tooltip shows the full path. Here the arguments matter more.
+    let origin = request.origin;
+    let command = match origin.command.trim().strip_prefix(&origin.executable) {
+        Some(arguments) if !origin.executable.is_empty() => {
+            let program = origin.executable.rsplit('/').next().unwrap_or_default();
+            format!("{program}{arguments}")
+        }
+        _ => origin.command.trim().to_string(),
+    };
+    v_flex()
+        .pl(px(48.))
+        .gap_0p5()
+        .child(div().font_family(mono).text_size(px(11.)).child(command))
+        .when(!parents.is_empty(), |this| {
+            this.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(palette.muted))
+                    .child(format!("via {parents}")),
+            )
         })
         .into_any_element()
+}
+
+/// A waiting request of either kind, so both can share one list.
+struct Waiting<'a> {
+    id: &'a str,
+    aws: bool,
+    /// The AWS profile or secret name.
+    resource: &'a str,
+    verified: bool,
+    process_tree: &'a [ProcessIdentity],
+    origin: &'a ProcessIdentity,
+    requested_at: u64,
+    asks: usize,
+}
+
+/// Every waiting request, oldest first.
+fn waiting_requests(snapshot: &AppSnapshot) -> Vec<Waiting<'_>> {
+    let aws = snapshot.pending_aws.iter().map(|request| Waiting {
+        id: &request.id,
+        aws: true,
+        resource: &request.profile,
+        verified: request.verified,
+        process_tree: &request.process_tree,
+        origin: &request.origin,
+        requested_at: request.requested_at,
+        asks: request.asks,
+    });
+    let secrets = snapshot.pending.iter().map(|request| Waiting {
+        id: &request.id,
+        aws: false,
+        resource: &request.secret,
+        verified: request.verified,
+        process_tree: &request.process_tree,
+        origin: &request.origin,
+        requested_at: request.requested_at,
+        asks: request.asks,
+    });
+    let mut requests: Vec<_> = aws.chain(secrets).collect();
+    requests
+        .sort_by(|left, right| (left.requested_at, left.id).cmp(&(right.requested_at, right.id)));
+    requests
+}
+
+/// The processes that every one of these trees runs under, top first and without launchd. For one
+/// tree that's its whole chain, down to the requester.
+fn shared_processes(trees: &[&[ProcessIdentity]]) -> Vec<ProcessIdentity> {
+    let Some((first, rest)) = trees.split_first() else {
+        return Vec::new();
+    };
+    first
+        .iter()
+        .rev()
+        .filter(|process| !is_launchd_process(process))
+        .filter(|process| {
+            rest.iter()
+                .all(|tree| tree.iter().any(|other| same_process(other, process)))
+        })
+        .cloned()
+        .collect()
 }
 
 fn compact_process_label(process: &ProcessIdentity) -> String {
@@ -3374,8 +3710,8 @@ fn rebuild_tray_menu(menu: &Menu, snapshot: &AppSnapshot) -> tray_icon::menu::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_process_label, default_grant_process, format_duration, suggested_alias,
-        suggested_role,
+        compact_process_label, default_grant_process, format_duration, shared_processes,
+        suggested_alias, suggested_role,
     };
     use secretd::aws::AwsAccessLevel;
     use secretd::process::ProcessIdentity;
@@ -3425,6 +3761,37 @@ mod tests {
         let tree = vec![requester.clone(), shell, launchd];
 
         assert_eq!(default_grant_process(&tree), Some(requester));
+    }
+
+    #[test]
+    fn several_requests_offer_only_the_processes_above_all_of_them() {
+        let launchd = process(1, "/sbin/launchd");
+        let app = process(10, "/Applications/T3 Code.app/Contents/MacOS/T3 Code");
+        let script = process(20, "/opt/homebrew/bin/bun");
+        let tree = |requester, parent: &ProcessIdentity| {
+            vec![
+                process(requester, "/usr/local/bin/aws"),
+                parent.clone(),
+                app.clone(),
+                launchd.clone(),
+            ]
+        };
+        let first = tree(30, &script);
+        let sibling = tree(31, &script);
+        let elsewhere = tree(32, &process(21, "/usr/bin/python3"));
+
+        // One request offers its whole chain, top first, down to the requester.
+        assert_eq!(
+            shared_processes(&[&first]),
+            vec![app.clone(), script.clone(), first[0].clone()]
+        );
+        // Siblings share their script and everything above it.
+        assert_eq!(
+            shared_processes(&[&first, &sibling]),
+            vec![app.clone(), script]
+        );
+        // Requests from different scripts share only the app.
+        assert_eq!(shared_processes(&[&first, &sibling, &elsewhere]), vec![app]);
     }
 
     #[test]
