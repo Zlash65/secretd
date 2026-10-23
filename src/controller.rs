@@ -111,7 +111,6 @@ pub struct AwsCredentialDenial {
     pub process: ProcessIdentity,
     pub created_at: u64,
     pub expires_at: u64,
-    process_tree: Vec<ProcessIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -388,7 +387,9 @@ impl Controller {
         if verified
             && self.aws_process_denials.iter().any(|denial| {
                 denial.profile == profile
-                    && process_trees_overlap(&denial.process_tree, &process_tree)
+                    && process_tree
+                        .iter()
+                        .any(|process| same_process(&denial.process, process))
             })
         {
             return Ok(AwsRequestOutcome::Denied);
@@ -468,6 +469,15 @@ impl Controller {
             .get(id)
             .cloned()
             .ok_or_else(|| VaultError("Request is no longer pending".into()))?;
+        let boundary = if request.verified && (level.is_some() || remember_denial) {
+            Some(validated_grant_process(
+                &request.process_tree,
+                &request.origin,
+                grant_process,
+            )?)
+        } else {
+            None
+        };
         let resolution = if let Some(level) = level {
             if !self.vault.unlocked() {
                 return Err(VaultError("Vault is locked".into()));
@@ -477,13 +487,11 @@ impl Controller {
                 .ok_or_else(|| VaultError("AWS SSO is not configured in secretd".into()))?
                 .target(&request.profile)
                 .map_err(VaultError)?;
-            let audit_process = if request.verified {
+            let audit_process = if let Some(grant_process) = &boundary {
                 let ttl_seconds = validated_grant_seconds(ttl_seconds)?;
-                let grant_process =
-                    validated_grant_process(&request.process_tree, &request.origin, grant_process)?;
                 self.aws_process_decisions.retain(|decision| {
                     decision.profile != request.profile
-                        || !same_process(&decision.process, &grant_process)
+                        || !same_process(&decision.process, grant_process)
                 });
                 let now = now_millis();
                 self.aws_process_decisions.push(AwsCredentialGrant {
@@ -496,9 +504,9 @@ impl Controller {
                 });
                 self.aws_process_denials.retain(|denial| {
                     denial.profile != request.profile
-                        || !process_trees_overlap(&denial.process_tree, &request.process_tree)
+                        || !same_process(&denial.process, grant_process)
                 });
-                grant_process
+                grant_process.clone()
             } else {
                 request.origin.clone()
             };
@@ -518,8 +526,8 @@ impl Controller {
             });
             AwsRequestResolution::Approved(level)
         } else {
-            if request.verified && remember_denial {
-                self.remember_aws_denial(&request);
+            if let Some(process) = &boundary {
+                self.remember_aws_denial(&request.profile, process);
             }
             self.record_audit(AuditEntry {
                 id: String::new(),
@@ -527,7 +535,7 @@ impl Controller {
                 action: AuditAction::Denied,
                 secret: aws_audit_resource(&request.profile),
                 ttl_seconds: (request.verified && remember_denial).then_some(DEFAULT_GRANT_SECONDS),
-                process: request.origin.clone(),
+                process: boundary.clone().unwrap_or_else(|| request.origin.clone()),
             });
             AwsRequestResolution::Denied
         };
@@ -535,7 +543,48 @@ impl Controller {
         if let Some(sender) = self.pending_aws_resolutions.remove(id) {
             let _ = sender.send(resolution);
         }
+        if let Some(process) = boundary {
+            self.resolve_pending_aws_requests(&request.profile, &process, resolution);
+        }
         Ok(())
+    }
+
+    fn resolve_pending_aws_requests(
+        &mut self,
+        profile: &str,
+        process: &ProcessIdentity,
+        resolution: AwsRequestResolution,
+    ) {
+        let requests: Vec<_> = self
+            .pending_aws
+            .values()
+            .filter(|request| {
+                request.verified
+                    && request.profile == profile
+                    && request
+                        .process_tree
+                        .iter()
+                        .any(|ancestor| same_process(process, ancestor))
+            })
+            .cloned()
+            .collect();
+        for request in requests {
+            self.pending_aws.remove(&request.id);
+            if let Some(sender) = self.pending_aws_resolutions.remove(&request.id) {
+                let _ = sender.send(resolution);
+            }
+            self.record_audit(AuditEntry {
+                id: String::new(),
+                occurred_at: 0,
+                action: match resolution {
+                    AwsRequestResolution::Approved(_) => AuditAction::AutoGranted,
+                    AwsRequestResolution::Denied => AuditAction::Denied,
+                },
+                secret: aws_audit_resource(profile),
+                ttl_seconds: None,
+                process: request.origin,
+            });
+        }
     }
 
     pub fn timeout_aws_request(&mut self, id: &str) {
@@ -544,7 +593,12 @@ impl Controller {
         };
         self.pending_aws_resolutions.remove(id);
         if request.verified {
-            self.remember_aws_denial(&request);
+            self.remember_aws_denial(&request.profile, &request.origin);
+            self.resolve_pending_aws_requests(
+                &request.profile,
+                &request.origin,
+                AwsRequestResolution::Denied,
+            );
         }
         self.record_audit(AuditEntry {
             id: String::new(),
@@ -556,24 +610,16 @@ impl Controller {
         });
     }
 
-    fn remember_aws_denial(&mut self, request: &PendingAwsCredentialRequest) {
-        self.aws_process_denials.retain(|denial| {
-            denial.profile != request.profile
-                || !process_trees_overlap(&denial.process_tree, &request.process_tree)
-        });
+    fn remember_aws_denial(&mut self, profile: &str, process: &ProcessIdentity) {
+        self.aws_process_denials
+            .retain(|denial| denial.profile != profile || !same_process(&denial.process, process));
         let now = now_millis();
         self.aws_process_denials.push(AwsCredentialDenial {
             id: Uuid::new_v4().to_string(),
-            profile: request.profile.clone(),
-            process: request.origin.clone(),
+            profile: profile.to_string(),
+            process: process.clone(),
             created_at: now,
             expires_at: now.saturating_add(DEFAULT_GRANT_SECONDS * 1_000),
-            process_tree: request
-                .process_tree
-                .iter()
-                .filter(|process| !is_launchd_process(process))
-                .cloned()
-                .collect(),
         });
     }
 
@@ -836,10 +882,10 @@ impl Controller {
                 ApprovalDecision::Once => AuditAction::AllowedOnce,
                 ApprovalDecision::Temporary => AuditAction::GrantedTemporarily,
             },
-            secret: request.secret,
+            secret: request.secret.clone(),
             ttl_seconds: (decision == ApprovalDecision::Temporary)
                 .then_some(ttl_seconds.unwrap_or(DEFAULT_GRANT_SECONDS)),
-            process: grant_process.unwrap_or(request.origin),
+            process: grant_process.clone().unwrap_or(request.origin),
         });
         self.pending.remove(id);
         self.waiting_for_unlock.remove(id);
@@ -850,6 +896,36 @@ impl Controller {
                 RequestResolution::Approved
             };
             let _ = sender.send(resolution);
+        }
+        if let Some(process) = grant_process {
+            let requests: Vec<_> = self
+                .pending
+                .values()
+                .filter(|pending| {
+                    pending.verified
+                        && pending.secret == request.secret
+                        && pending
+                            .process_tree
+                            .iter()
+                            .any(|ancestor| same_process(&process, ancestor))
+                })
+                .cloned()
+                .collect();
+            for pending in requests {
+                self.pending.remove(&pending.id);
+                self.waiting_for_unlock.remove(&pending.id);
+                if let Some(sender) = self.pending_resolutions.remove(&pending.id) {
+                    let _ = sender.send(RequestResolution::Approved);
+                }
+                self.record_audit(AuditEntry {
+                    id: String::new(),
+                    occurred_at: 0,
+                    action: AuditAction::AutoGranted,
+                    secret: pending.secret,
+                    ttl_seconds: None,
+                    process: pending.origin,
+                });
+            }
         }
         Ok(())
     }
@@ -896,11 +972,6 @@ fn normalize_aws_profile(profile: &str) -> Result<String, VaultError> {
 
 fn aws_audit_resource(profile: &str) -> String {
     format!("aws/{profile}")
-}
-
-fn process_trees_overlap(left: &[ProcessIdentity], right: &[ProcessIdentity]) -> bool {
-    left.iter()
-        .any(|left| right.iter().any(|right| same_process(left, right)))
 }
 
 fn validated_grant_process(
@@ -1174,7 +1245,9 @@ mod tests {
             panic!("first request should be pending");
         };
 
-        controller.respond_aws(&id, None, None, None).unwrap();
+        controller
+            .respond_aws(&id, None, Some(ancestor.clone()), None)
+            .unwrap();
 
         assert_eq!(receiver.recv().unwrap(), AwsRequestResolution::Denied);
         let snapshot = controller.snapshot();
@@ -1284,45 +1357,193 @@ mod tests {
     }
 
     #[test]
-    fn latest_aws_approval_replaces_an_older_grant() {
+    fn aws_parent_decisions_resolve_only_pending_requests_within_the_selected_scope() {
+        for level in [
+            None,
+            Some(AwsAccessLevel::ReadOnly),
+            Some(AwsAccessLevel::Admin),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut controller = Controller::new(directory.path().join("vault.json"));
+            controller.create_vault("correct horse").unwrap();
+            let mut configuration = aws_configuration();
+            let mut other_target = configuration.targets[0].clone();
+            other_target.profile = "dev".into();
+            configuration.targets.push(other_target);
+            controller.save_aws_configuration(configuration).unwrap();
+            let parent = live_process();
+            let shared_ancestor = process(10, "/bin/zsh");
+            let mut covered = Vec::new();
+            for pid in 20..44 {
+                let AwsRequestOutcome::Pending { id, receiver } = controller
+                    .begin_aws_request(
+                        "prod",
+                        vec![
+                            process(pid, "/usr/local/bin/tool"),
+                            parent.clone(),
+                            shared_ancestor.clone(),
+                        ],
+                        true,
+                    )
+                    .unwrap()
+                else {
+                    panic!("child should require a decision");
+                };
+                covered.push((id, receiver));
+            }
+            let mut reused_pid = parent.clone();
+            reused_pid.started_at.push_str("-reused");
+            let mut changed_executable = parent.clone();
+            changed_executable.executable.push_str("-other");
+            let mut excluded = Vec::new();
+            for (profile, tree, verified) in [
+                ("dev", vec![parent.clone()], true),
+                ("prod", vec![parent.clone()], false),
+                (
+                    "prod",
+                    vec![process(50, "/usr/local/bin/tool"), shared_ancestor],
+                    true,
+                ),
+                ("prod", vec![reused_pid], true),
+                ("prod", vec![changed_executable], true),
+            ] {
+                let AwsRequestOutcome::Pending { id, receiver } = controller
+                    .begin_aws_request(profile, tree, verified)
+                    .unwrap()
+                else {
+                    panic!("unrelated request should remain pending");
+                };
+                excluded.push((id, receiver));
+            }
+
+            controller
+                .respond_aws(&covered[0].0, level, Some(parent.clone()), None)
+                .unwrap();
+
+            let resolution =
+                level.map_or(AwsRequestResolution::Denied, AwsRequestResolution::Approved);
+            for (_, receiver) in covered {
+                assert_eq!(
+                    receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                    resolution
+                );
+            }
+            let snapshot = controller.snapshot();
+            assert_eq!(snapshot.pending_aws.len(), excluded.len());
+            assert_eq!(snapshot.audit.len(), 24);
+            assert!(snapshot.audit.iter().all(|entry| entry.action
+                == if level.is_some() {
+                    if same_process(&entry.process, &parent) {
+                        AuditAction::GrantedTemporarily
+                    } else {
+                        AuditAction::AutoGranted
+                    }
+                } else {
+                    AuditAction::Denied
+                }));
+            for (id, receiver) in excluded {
+                assert!(snapshot.pending_aws.iter().any(|request| request.id == id));
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+            }
+            if level.is_none() {
+                assert_eq!(snapshot.aws_denials.len(), 1);
+                assert_eq!(snapshot.aws_denials[0].process, parent);
+            } else {
+                assert_eq!(snapshot.aws_grants.len(), 1);
+                assert_eq!(snapshot.aws_grants[0].process, parent);
+            }
+            let outcome = controller
+                .begin_aws_request("prod", vec![parent], true)
+                .unwrap();
+            match level {
+                Some(level) => assert!(
+                    matches!(outcome, AwsRequestOutcome::Immediate(actual) if actual == level)
+                ),
+                None => assert!(matches!(outcome, AwsRequestOutcome::Denied)),
+            }
+        }
+    }
+
+    #[test]
+    fn default_aws_denial_does_not_cover_sibling_requests() {
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller::new(directory.path().join("vault.json"));
-        controller.create_vault("correct horse").unwrap();
-        controller
-            .save_aws_configuration(aws_configuration())
-            .unwrap();
-        let terraform = live_process();
-        let AwsRequestOutcome::Pending { id: admin_id, .. } = controller
-            .begin_aws_request("prod", vec![terraform.clone()], true)
+        let parent = process(10, "/bin/zsh");
+        let requester = process(20, "/usr/local/bin/tool");
+        let AwsRequestOutcome::Pending { id, .. } = controller
+            .begin_aws_request("prod", vec![requester.clone(), parent.clone()], true)
             .unwrap()
         else {
-            panic!("admin request should be pending");
+            panic!("request should be pending");
         };
         let AwsRequestOutcome::Pending {
-            id: read_only_id, ..
+            id: sibling_id,
+            receiver,
         } = controller
-            .begin_aws_request("prod", vec![terraform.clone()], true)
+            .begin_aws_request(
+                "prod",
+                vec![process(21, "/usr/local/bin/tool"), parent.clone()],
+                true,
+            )
             .unwrap()
         else {
-            panic!("read-only request should be pending");
+            panic!("sibling should be pending");
         };
 
-        controller
-            .respond_aws(&admin_id, Some(AwsAccessLevel::Admin), None, None)
-            .unwrap();
-        controller
-            .respond_aws(&read_only_id, Some(AwsAccessLevel::ReadOnly), None, None)
-            .unwrap();
+        controller.respond_aws(&id, None, None, None).unwrap();
 
-        let grants = controller.snapshot().aws_grants;
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].level, AwsAccessLevel::ReadOnly);
+        assert_eq!(controller.snapshot().aws_denials[0].process, requester);
+        assert!(
+            controller
+                .snapshot()
+                .pending_aws
+                .iter()
+                .any(|request| request.id == sibling_id)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert!(matches!(
             controller
-                .begin_aws_request("prod", vec![terraform], true)
+                .begin_aws_request("prod", vec![parent], true)
                 .unwrap(),
-            AwsRequestOutcome::Immediate(AwsAccessLevel::ReadOnly)
+            AwsRequestOutcome::Pending { .. }
         ));
+    }
+
+    #[test]
+    fn aws_block_rejects_a_boundary_outside_the_verified_tree_or_launchd() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller::new(directory.path().join("vault.json"));
+        let launchd = process(1, "/sbin/launchd");
+        let AwsRequestOutcome::Pending { id, receiver } = controller
+            .begin_aws_request(
+                "prod",
+                vec![process(20, "/usr/local/bin/tool"), launchd.clone()],
+                true,
+            )
+            .unwrap()
+        else {
+            panic!("request should be pending");
+        };
+
+        for boundary in [launchd, process(99, "/usr/local/bin/other")] {
+            assert!(
+                controller
+                    .respond_aws(&id, None, Some(boundary), None)
+                    .is_err()
+            );
+            assert!(controller.snapshot().aws_denials.is_empty());
+            assert_eq!(controller.snapshot().pending_aws.len(), 1);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[test]
@@ -1452,6 +1673,166 @@ mod tests {
                 .unwrap(),
             RequestOutcome::Immediate(_)
         ));
+    }
+
+    #[test]
+    fn temporary_secret_grants_resolve_covered_pending_requests_but_allow_once_does_not() {
+        for decision in [ApprovalDecision::Once, ApprovalDecision::Temporary] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut controller = Controller::new(directory.path().join("vault.json"));
+            controller.create_vault("correct horse").unwrap();
+            controller.save_secret("token", "secret", None).unwrap();
+            controller.save_secret("other", "secret", None).unwrap();
+            let parent = process(10, "/usr/local/bin/app");
+            let shared_ancestor = process(1, "/sbin/launchd");
+            let RequestOutcome::Pending { id, receiver } = controller
+                .begin_request(
+                    "token",
+                    vec![
+                        process(20, "/usr/local/bin/tool"),
+                        parent.clone(),
+                        shared_ancestor.clone(),
+                    ],
+                    true,
+                )
+                .unwrap()
+            else {
+                panic!("request should be pending");
+            };
+            let RequestOutcome::Pending {
+                id: sibling_id,
+                receiver: sibling_receiver,
+            } = controller
+                .begin_request(
+                    "token",
+                    vec![
+                        process(21, "/usr/local/bin/tool"),
+                        parent.clone(),
+                        shared_ancestor.clone(),
+                    ],
+                    true,
+                )
+                .unwrap()
+            else {
+                panic!("sibling should be pending");
+            };
+            let mut excluded = Vec::new();
+            for (secret, tree, verified) in [
+                ("other", vec![parent.clone()], true),
+                ("token", vec![parent.clone()], false),
+                (
+                    "token",
+                    vec![process(30, "/usr/local/bin/tool"), shared_ancestor],
+                    true,
+                ),
+            ] {
+                let RequestOutcome::Pending { id, receiver } =
+                    controller.begin_request(secret, tree, verified).unwrap()
+                else {
+                    panic!("unrelated request should be pending");
+                };
+                excluded.push((id, receiver));
+            }
+
+            controller
+                .respond(&id, decision, None, Some(parent))
+                .unwrap();
+
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                RequestResolution::Approved
+            );
+            if decision == ApprovalDecision::Temporary {
+                assert_eq!(
+                    sibling_receiver
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap(),
+                    RequestResolution::Approved
+                );
+                assert_eq!(
+                    controller.snapshot().audit[0].action,
+                    AuditAction::AutoGranted
+                );
+                assert!(
+                    !controller
+                        .snapshot()
+                        .pending
+                        .iter()
+                        .any(|request| request.id == sibling_id)
+                );
+            } else {
+                assert!(matches!(
+                    sibling_receiver.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                assert!(
+                    controller
+                        .snapshot()
+                        .pending
+                        .iter()
+                        .any(|request| request.id == sibling_id)
+                );
+            }
+            for (id, receiver) in excluded {
+                assert!(
+                    controller
+                        .snapshot()
+                        .pending
+                        .iter()
+                        .any(|request| request.id == id)
+                );
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unverified_aws_decisions_only_resolve_the_current_request() {
+        for level in [None, Some(AwsAccessLevel::ReadOnly)] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut controller = Controller::new(directory.path().join("vault.json"));
+            controller.create_vault("correct horse").unwrap();
+            controller
+                .save_aws_configuration(aws_configuration())
+                .unwrap();
+            let parent = live_process();
+            let AwsRequestOutcome::Pending { id, receiver } = controller
+                .begin_aws_request("prod", vec![parent.clone()], false)
+                .unwrap()
+            else {
+                panic!("request should be pending");
+            };
+            let AwsRequestOutcome::Pending {
+                id: sibling_id,
+                receiver: sibling_receiver,
+            } = controller
+                .begin_aws_request("prod", vec![parent.clone()], true)
+                .unwrap()
+            else {
+                panic!("sibling should be pending");
+            };
+
+            controller
+                .respond_aws(&id, level, Some(parent), None)
+                .unwrap();
+
+            assert_eq!(
+                receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+                level.map_or(AwsRequestResolution::Denied, AwsRequestResolution::Approved)
+            );
+            let snapshot = controller.snapshot();
+            assert!(snapshot.aws_grants.is_empty());
+            assert!(snapshot.aws_denials.is_empty());
+            assert_eq!(snapshot.pending_aws.len(), 1);
+            assert_eq!(snapshot.pending_aws[0].id, sibling_id);
+            assert!(matches!(
+                sibling_receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[test]

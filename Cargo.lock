@@ -7057,6 +7057,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tray-icon",
+ "url",
  "uuid",
  "zeroize",
 ]

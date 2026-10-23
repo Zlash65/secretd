@@ -724,7 +724,7 @@ impl MainView {
 
     fn begin_aws_refresh(&mut self, cx: &mut Context<Self>) {
         match begin_aws_login(Self::controller(cx), cx.global::<AppState>().notify()) {
-            Ok(()) => self.toast("AWS SSO login started", false, cx),
+            Ok(()) => self.toast("Refreshing AWS session and accounts", false, cx),
             Err(error) => self.toast(error, true, cx),
         }
     }
@@ -1219,13 +1219,10 @@ impl MainView {
         );
         content = match &snapshot.aws_login {
             AwsLoginStatus::Starting => {
-                content.child(status_pill("Starting AWS login…", AMBER, SURFACE_MUTED))
+                content.child(status_pill("Checking AWS session…", AMBER, SURFACE_MUTED))
             }
             AwsLoginStatus::AwaitingUser(authorization) => {
-                let url = authorization
-                    .verification_uri_complete
-                    .clone()
-                    .unwrap_or_else(|| authorization.verification_uri.clone());
+                let url = authorization.url.clone();
                 content.child(
                     card()
                         .bg(rgb(GREEN_SOFT))
@@ -1235,9 +1232,7 @@ impl MainView {
                                 .child("Complete sign-in in your browser"),
                         )
                         .child(
-                            div()
-                                .font_family("monospace")
-                                .child(format!("Verification code: {}", authorization.user_code)),
+                            div().child("Sign in or approve access in the browser on this computer. secretd will continue automatically."),
                         )
                         .child(
                             Button::new("open-aws-login")
@@ -1258,7 +1253,7 @@ impl MainView {
             )),
             AwsLoginStatus::LoggedIn { expires_at } => content.child(status_pill(
                 &format!(
-                    "Signed in · access token expires in {}",
+                    "Signed in · token renews automatically ({} remaining)",
                     duration_until_seconds(*expires_at)
                 ),
                 GREEN,
@@ -2237,9 +2232,10 @@ impl RequestView {
                             })
                             .on_click({
                                 let entity = entity.clone();
+                                let process = process.clone();
                                 move |_, _, cx| {
                                     entity.update(cx, |this, cx| {
-                                        this.respond_aws(deny_id.clone(), None, None, cx)
+                                        this.respond_aws(deny_id.clone(), None, process.clone(), cx)
                                     });
                                 }
                             }),
@@ -2631,7 +2627,7 @@ fn process_grant_selector(
                         .text_size(px(12.))
                         .font_semibold()
                         .child(if enabled {
-                            "Grant boundary"
+                            "Process boundary"
                         } else {
                             "Requesting process"
                         }),
@@ -2641,7 +2637,7 @@ fn process_grant_selector(
                         .text_size(px(11.))
                         .text_color(rgb(MUTED))
                         .child(if enabled {
-                            "Choose which process and its children may reuse this access."
+                            "Choose a process to include its child processes."
                         } else {
                             "This process chain is informational because access can only be allowed once."
                         }),
@@ -2714,7 +2710,7 @@ fn process_grant_selector(
                     .text_size(px(11.))
                     .text_color(rgb(GREEN))
                     .child(format!(
-                        "Access will follow {name} and its child processes."
+                        "Selected: {name} and its child processes."
                     )),
             )
         })

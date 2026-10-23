@@ -38,11 +38,13 @@ are encrypted together. Temporary grants and activity history exist only in memo
 
 ## AWS IAM Identity Center
 
-secretd can own the IAM Identity Center device-login flow without invoking the AWS CLI or storing
+secretd handles IAM Identity Center browser login with PKCE without invoking the AWS CLI or storing
 SSO settings in `~/.aws/config`.
 
-1. Open **AWS SSO**, enter the access portal URL and IAM Identity Center Region, then sign in with
-   the device flow. secretd discovers the AWS accounts and roles assigned to that identity.
+1. Open **AWS SSO**, enter the access portal URL and IAM Identity Center Region, then complete
+   sign-in using your default browser on the same computer. The browser returns to a temporary local callback;
+   there is no device code to enter. secretd discovers the AWS accounts and roles assigned to that
+   identity.
 2. Assign a local profile alias to each account you want to expose, and select the discovered roles
    secretd should offer as read-only and admin. Connection details, discovery results, mappings, and
    OIDC tokens are stored inside the encrypted vault.
@@ -69,9 +71,15 @@ region = ca-central-1
 4. Run tools normally. When a process asks for a configured profile, secretd opens a compact,
    independent approval window with its verified process tree and asks whether to deny the request
    or grant read-only or admin credentials. The approval window closes after the decision. If the
-   SSO session has expired, secretd opens its main window, displays the AWS verification URL and
-   device code, waits for login, and then resumes the original credential request. `secretd aws
-   login` remains available for an explicit refresh and account rediscovery.
+   access token has expired, secretd renews it silently using its saved refresh token. Only when the
+   session can no longer be renewed does it open your browser for sign-in, then resume the original
+   credential request. **Refresh** and `secretd aws login` also reuse or renew the saved session before
+   requesting browser sign-in, and rediscover the available accounts and roles. Network failures and
+   temporary AWS errors preserve the saved session and report an error instead of starting a login.
+
+The browser flow can reuse an existing browser sign-in when available. AWS or your identity provider
+may still require authentication or consent when the underlying SSO session ends. Session duration
+is controlled by your IAM Identity Center administrator.
 
 This supports a saved-plan workflow without a caller-controlled access-level variable:
 
@@ -85,14 +93,20 @@ The selected role is pinned to the chosen process boundary and its children. New
 the active-access screen (up to 60 minutes remaining). A later Terraform invocation does not reuse
 the grant unless it is still a descendant of the selected live process boundary. Already-issued AWS
 role credentials remain usable until their AWS-provided expiration time; revoking or expiring a
-grant prevents secretd from issuing another set automatically. A denial or unanswered request is
-remembered for 30 minutes for the same verified process lineage and profile, preventing retry loops
-from repeatedly opening approval windows. Active grants and remembered denials appear under
+grant prevents secretd from issuing another set automatically. A denial is remembered for 30 minutes
+for the selected verified process boundary and profile.
+Unanswered requests use the requesting process as the boundary. Selecting a parent applies the grant
+or block to its children and immediately resolves their pending requests for that profile, closing
+the approval window when no requests remain. This prevents retry loops from repeatedly opening
+approval windows. Active grants and remembered denials appear under
 **Grants**, where they can be revoked or unblocked immediately.
 
 On **Grants**, AWS access can be switched between read-only and admin without changing the process
 boundary or expiration. The selected role applies to future credential requests. Credentials already
 issued by AWS remain usable until their expiration.
+
+Temporary secret grants also resolve pending requests for the same secret within the selected
+process boundary. Allow once and closing the approval window affect only the current request.
 
 The generic secret vault and `get` request remain compatible with the Deno implementation. Vaults
 that contain the Rust application's AWS extension require an AWS-aware secretd version.

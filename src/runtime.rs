@@ -172,9 +172,7 @@ fn dispatch(event: AppEvent, cx: &mut App) {
                 }
                 secretd::aws::AwsLoginStatus::AwaitingUser(authorization) => {
                     show_aws_login(cx);
-                    let url = authorization
-                        .verification_uri_complete
-                        .unwrap_or(authorization.verification_uri);
+                    let url = authorization.url;
                     let should_open = {
                         let windows = cx.global_mut::<Windows>();
                         if windows.opened_aws_login_url.as_deref() == Some(url.as_str()) {

@@ -172,7 +172,7 @@ fn handle_connection(
             "aws-login" => {
                 begin_aws_login(Arc::clone(controller), Arc::clone(notify))?;
                 Ok(Zeroizing::new(
-                    "AWS SSO login started in the secretd window".into(),
+                    "AWS SSO refresh started in secretd; your browser will open if sign-in is needed".into(),
                 ))
             }
             _ => Err("Invalid request".into()),
@@ -343,34 +343,17 @@ pub fn begin_aws_login(
     controller: Arc<Mutex<Controller>>,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(), String> {
-    let (broker, initial_settings) = controller
+    let (broker, _) = controller
         .lock()
         .map_err(|_| "secretd state is unavailable".to_string())?
         .preview_aws_login()
         .map_err(|error| error.to_string())?;
-    let initial_expiration = initial_settings
-        .token
-        .as_ref()
-        .map(|token| token.access_token_expires_at);
     let login_controller = Arc::clone(&controller);
     let login_notify = Arc::clone(&notify);
     let spawn_result = thread::Builder::new()
         .name("secretd-aws-login".into())
         .spawn(move || {
             let result = broker.operation().and_then(|_operation| {
-                let current_expiration = login_controller
-                    .lock()
-                    .map_err(|_| "secretd state is unavailable".to_string())?
-                    .aws_credential_context()
-                    .map_err(|error| error.to_string())?
-                    .1
-                    .token
-                    .as_ref()
-                    .map(|token| token.access_token_expires_at);
-                if current_expiration != initial_expiration {
-                    login_notify();
-                    return Ok(());
-                }
                 let (_, settings) = login_controller
                     .lock()
                     .map_err(|_| "secretd state is unavailable".to_string())?
@@ -411,29 +394,40 @@ fn run_aws_login(
     controller: Arc<Mutex<Controller>>,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(), String> {
-    let device_controller = Arc::clone(&controller);
-    let device_notify = Arc::clone(&notify);
-    let mut settings = match broker.login(settings, move |authorization| {
-        if let Ok(mut controller) = device_controller.lock() {
-            controller.set_aws_login_status(AwsLoginStatus::AwaitingUser(authorization));
-        }
-        device_notify();
-    }) {
-        Ok(settings) => settings,
-        Err(error) => {
-            if let Ok(mut controller) = controller.lock() {
-                controller.complete_aws_login(Err(error.clone()));
-            }
-            notify();
-            return Err(error);
-        }
-    };
-    controller
-        .lock()
-        .map_err(|_| "secretd state is unavailable".to_string())?
-        .set_aws_login_status(AwsLoginStatus::Discovering);
-    notify();
+    // Discovery renews expired access tokens before using them. Only a rejected or
+    // missing session needs browser authorization; network/service errors remain errors.
+    let mut settings = settings;
     let discovery = broker.discover_accounts(&mut settings);
+    let discovery = if discovery
+        .as_ref()
+        .is_err_and(|error| is_session_expired_error(error))
+    {
+        let browser_controller = Arc::clone(&controller);
+        let browser_notify = Arc::clone(&notify);
+        settings = match broker.login(settings, move |authorization| {
+            if let Ok(mut controller) = browser_controller.lock() {
+                controller.set_aws_login_status(AwsLoginStatus::AwaitingUser(authorization));
+            }
+            browser_notify();
+        }) {
+            Ok(settings) => settings,
+            Err(error) => {
+                if let Ok(mut controller) = controller.lock() {
+                    controller.complete_aws_login(Err(error.clone()));
+                }
+                notify();
+                return Err(error);
+            }
+        };
+        controller
+            .lock()
+            .map_err(|_| "secretd state is unavailable".to_string())?
+            .set_aws_login_status(AwsLoginStatus::Discovering);
+        notify();
+        broker.discover_accounts(&mut settings)
+    } else {
+        discovery
+    };
     let mut controller = controller
         .lock()
         .map_err(|_| "secretd state is unavailable".to_string())?;

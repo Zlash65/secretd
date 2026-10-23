@@ -1,15 +1,22 @@
 use std::{
+    error::Error,
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use aws_config::{BehaviorVersion, Region};
-use aws_sdk_ssooidc::operation::create_token::CreateTokenError;
+use aws_sdk_ssooidc::{
+    config::endpoint::ResolveEndpoint, error::SdkError, operation::create_token::CreateTokenError,
+};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use zeroize::Zeroize;
 
-const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+mod browser;
+
+use browser::{BrowserLogin, LOGIN_TIMEOUT, REDIRECT_URI};
+
+const AUTHORIZATION_CODE_GRANT: &str = "authorization_code";
 const REFRESH_TOKEN_GRANT: &str = "refresh_token";
 const SSO_SCOPE: &str = "sso:account:access";
 const EXPIRY_SKEW_SECONDS: u64 = 60;
@@ -70,6 +77,8 @@ pub struct AwsOidcRegistration {
     pub client_id: String,
     pub client_secret: String,
     pub client_secret_expires_at: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authorization_endpoint: String,
 }
 
 impl Drop for AwsOidcRegistration {
@@ -258,10 +267,8 @@ impl AwsSettings {
 }
 
 #[derive(Clone, Debug)]
-pub struct AwsDeviceAuthorization {
-    pub verification_uri: String,
-    pub verification_uri_complete: Option<String>,
-    pub user_code: String,
+pub struct AwsBrowserAuthorization {
+    pub url: String,
     pub expires_at: u64,
 }
 
@@ -269,7 +276,7 @@ pub struct AwsDeviceAuthorization {
 pub enum AwsLoginStatus {
     Idle,
     Starting,
-    AwaitingUser(AwsDeviceAuthorization),
+    AwaitingUser(AwsBrowserAuthorization),
     Discovering,
     LoggedIn { expires_at: u64 },
     Failed(String),
@@ -322,84 +329,38 @@ impl AwsBroker {
     pub fn login(
         &self,
         mut settings: AwsSettings,
-        device_ready: impl FnOnce(AwsDeviceAuthorization),
+        browser_ready: impl FnOnce(AwsBrowserAuthorization),
     ) -> Result<AwsSettings, String> {
         settings.validate()?;
         self.runtime.block_on(async {
+            let browser = BrowserLogin::new().await?;
             let client = oidc_client(&settings.sso_region).await;
             ensure_registration(&client, &mut settings).await?;
             let registration = settings
                 .registration
                 .as_ref()
                 .ok_or_else(|| "AWS OIDC client registration is unavailable".to_string())?;
-            let authorization = client
-                .start_device_authorization()
+            browser_ready(AwsBrowserAuthorization {
+                url: browser.authorization_url(
+                    &registration.authorization_endpoint,
+                    &registration.client_id,
+                )?,
+                expires_at: now_seconds().saturating_add(LOGIN_TIMEOUT.as_secs()),
+            });
+            let code = browser.wait_for_code(LOGIN_TIMEOUT).await?;
+            let output = client
+                .create_token()
                 .client_id(&registration.client_id)
                 .client_secret(&registration.client_secret)
-                .start_url(&settings.start_url)
+                .grant_type(AUTHORIZATION_CODE_GRANT)
+                .redirect_uri(&browser.redirect_uri)
+                .code_verifier(browser.verifier.as_str())
+                .code(code.as_str())
                 .send()
                 .await
-                .map_err(|error| format!("Could not start AWS SSO login: {error}"))?;
-            let device_code = authorization
-                .device_code()
-                .ok_or_else(|| "AWS SSO did not return a device code".to_string())?
-                .to_string();
-            let verification_uri = authorization
-                .verification_uri()
-                .ok_or_else(|| "AWS SSO did not return a verification URL".to_string())?
-                .to_string();
-            let user_code = authorization
-                .user_code()
-                .ok_or_else(|| "AWS SSO did not return a user code".to_string())?
-                .to_string();
-            let expires_in = authorization.expires_in().max(1) as u64;
-            let mut interval = authorization.interval().max(1) as u64;
-            let deadline = now_seconds().saturating_add(expires_in);
-            device_ready(AwsDeviceAuthorization {
-                verification_uri,
-                verification_uri_complete: authorization
-                    .verification_uri_complete()
-                    .map(str::to_string),
-                user_code,
-                expires_at: deadline,
-            });
-
-            loop {
-                if now_seconds() >= deadline {
-                    return Err("AWS SSO login expired before it was approved".into());
-                }
-                tokio::time::sleep(Duration::from_secs(interval)).await;
-                let registration = settings
-                    .registration
-                    .as_ref()
-                    .expect("registration was established");
-                match client
-                    .create_token()
-                    .client_id(&registration.client_id)
-                    .client_secret(&registration.client_secret)
-                    .grant_type(DEVICE_CODE_GRANT)
-                    .device_code(&device_code)
-                    .send()
-                    .await
-                {
-                    Ok(output) => {
-                        settings.token = Some(token_from_output(&output, None)?);
-                        return Ok(settings);
-                    }
-                    Err(error)
-                        if error
-                            .as_service_error()
-                            .is_some_and(CreateTokenError::is_authorization_pending_exception) => {}
-                    Err(error)
-                        if error
-                            .as_service_error()
-                            .is_some_and(CreateTokenError::is_slow_down_exception) =>
-                    {
-                        interval = interval.saturating_add(5);
-                    }
-                    Err(error) => return Err(format!("AWS SSO login failed: {error}")),
-                }
-            }
+                .map_err(|error| format!("AWS SSO login failed: {}", aws_error_message(&error)))?;
+            settings.token = Some(token_from_output(&output, None)?);
+            Ok(settings)
         })
     }
 
@@ -485,7 +446,15 @@ impl AwsBroker {
                     .set_next_token(requested_token.clone())
                     .send()
                     .await
-                    .map_err(|error| format!("Could not list AWS accounts: {error}"))?;
+                    .map_err(|error| {
+                        if error.as_service_error().is_some_and(
+                            aws_sdk_sso::operation::list_accounts::ListAccountsError::is_unauthorized_exception,
+                        ) {
+                            AWS_SESSION_EXPIRED.to_string()
+                        } else {
+                            format!("Could not list AWS accounts: {}", aws_error_message(&error))
+                        }
+                    })?;
                 for account in output.account_list() {
                     let account_id = required(account.account_id(), "account ID")?;
                     let roles = list_account_roles(&client, &access_token, &account_id).await?;
@@ -541,7 +510,13 @@ async fn list_account_roles(
             .send()
             .await
             .map_err(|error| {
-                format!("Could not list roles for AWS account {account_id}: {error}")
+                if error.as_service_error().is_some_and(
+                    aws_sdk_sso::operation::list_account_roles::ListAccountRolesError::is_unauthorized_exception,
+                ) {
+                    AWS_SESSION_EXPIRED.to_string()
+                } else {
+                    format!("Could not list roles for AWS account {account_id}: {}", aws_error_message(&error))
+                }
             })?;
         roles.extend(
             output
@@ -578,19 +553,21 @@ async fn ensure_registration(
 ) -> Result<(), String> {
     let valid = settings.registration.as_ref().is_some_and(|registration| {
         registration.client_secret_expires_at > now_seconds().saturating_add(EXPIRY_SKEW_SECONDS)
+            && !registration.authorization_endpoint.is_empty()
     });
     if valid {
         return Ok(());
     }
-    settings.registration = None;
-    settings.token = None;
     let output = client
         .register_client()
         .client_name("secretd")
         .client_type("public")
         .scopes(SSO_SCOPE)
-        .grant_types(DEVICE_CODE_GRANT)
+        .grant_types(AUTHORIZATION_CODE_GRANT)
         .grant_types(REFRESH_TOKEN_GRANT)
+        // IAM Identity Center permits a dynamic port on a registered loopback URI.
+        .redirect_uris(REDIRECT_URI)
+        .issuer_url(&settings.start_url)
         .send()
         .await
         .map_err(|error| format!("Could not register secretd with AWS SSO: {error}"))?;
@@ -599,8 +576,25 @@ async fn ensure_registration(
         client_secret: required(output.client_secret(), "OIDC client secret")?,
         client_secret_expires_at: u64::try_from(output.client_secret_expires_at())
             .map_err(|_| "AWS SSO returned an invalid client expiration".to_string())?,
+        authorization_endpoint: browser_authorization_endpoint(&settings.sso_region).await?,
     });
+    settings.token = None;
     Ok(())
+}
+
+async fn browser_authorization_endpoint(region: &str) -> Result<String, String> {
+    let params = aws_sdk_ssooidc::config::endpoint::Params::builder()
+        .region(region)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let endpoint = aws_sdk_ssooidc::config::endpoint::DefaultResolver::new()
+        .resolve_endpoint(&params)
+        .await
+        .map_err(|error| format!("Could not resolve the AWS sign-in endpoint: {error}"))?;
+    Ok(format!(
+        "{}/authorize",
+        endpoint.url().trim_end_matches('/')
+    ))
 }
 
 async fn refresh_access_token(settings: &mut AwsSettings) -> Result<(), String> {
@@ -611,6 +605,14 @@ async fn refresh_access_token(settings: &mut AwsSettings) -> Result<(), String> 
     {
         return Ok(());
     }
+    let client = oidc_client(&settings.sso_region).await;
+    renew_access_token(&client, settings).await
+}
+
+async fn renew_access_token(
+    client: &aws_sdk_ssooidc::Client,
+    settings: &mut AwsSettings,
+) -> Result<(), String> {
     let registration = settings
         .registration
         .as_ref()
@@ -625,7 +627,6 @@ async fn refresh_access_token(settings: &mut AwsSettings) -> Result<(), String> 
         .map(|token| token.refresh_token.clone())
         .filter(|token| !token.is_empty())
         .ok_or_else(|| AWS_SESSION_EXPIRED.to_string())?;
-    let client = oidc_client(&settings.sso_region).await;
     let output = client
         .create_token()
         .client_id(&registration.client_id)
@@ -633,10 +634,60 @@ async fn refresh_access_token(settings: &mut AwsSettings) -> Result<(), String> 
         .grant_type(REFRESH_TOKEN_GRANT)
         .refresh_token(&previous_refresh)
         .send()
-        .await
-        .map_err(|_| AWS_SESSION_EXPIRED.to_string())?;
+        .await;
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let message = refresh_token_error(&error);
+            if is_session_expired_error(&message) {
+                // Do not retry a rejected refresh token while starting browser sign-in.
+                settings.token = None;
+                if error.as_service_error().is_some_and(|error| {
+                    error.is_invalid_client_exception()
+                        || error.is_unauthorized_client_exception()
+                        || error.is_invalid_request_exception()
+                }) {
+                    settings.registration = None;
+                }
+            }
+            return Err(message);
+        }
+    };
     settings.token = Some(token_from_output(&output, Some(previous_refresh))?);
     Ok(())
+}
+
+fn refresh_token_error<R: std::fmt::Debug>(error: &SdkError<CreateTokenError, R>) -> String {
+    if error.as_service_error().is_some_and(|error| {
+        error.is_invalid_grant_exception()
+            || error.is_expired_token_exception()
+            || error.is_invalid_client_exception()
+            || error.is_unauthorized_client_exception()
+            // AWS also rejects stale refresh sessions with a generic invalid_request.
+            // A specific reason, such as a KMS configuration error, needs to be surfaced.
+            || matches!(error, CreateTokenError::InvalidRequestException(error) if error.reason().is_none())
+    }) {
+        AWS_SESSION_EXPIRED.to_string()
+    } else {
+        format!(
+            "Could not refresh AWS SSO session: {}",
+            aws_error_message(error)
+        )
+    }
+}
+
+fn aws_error_message<E: Error + 'static, R: std::fmt::Debug>(error: &SdkError<E, R>) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        let detail = error.to_string();
+        if !message.ends_with(&detail) {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        source = error.source();
+    }
+    message
 }
 
 fn token_from_output(
@@ -706,6 +757,8 @@ pub fn now_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
     use super::*;
 
     fn settings() -> AwsSettings {
@@ -724,6 +777,287 @@ mod tests {
             registration: None,
             token: None,
         }
+    }
+
+    fn session_settings() -> AwsSettings {
+        let mut settings = settings();
+        // Existing device-flow registrations remain valid for token renewal.
+        settings.registration = Some(AwsOidcRegistration {
+            client_id: "client".into(),
+            client_secret: "client-secret".into(),
+            client_secret_expires_at: now_seconds() + 3_600,
+            authorization_endpoint: String::new(),
+        });
+        settings.token = Some(AwsSsoToken {
+            access_token: "old-access".into(),
+            access_token_expires_at: 1,
+            refresh_token: "old-refresh".into(),
+        });
+        settings
+    }
+
+    async fn mock_oidc(
+        status: u16,
+        error_type: &str,
+        response: serde_json::Value,
+    ) -> (
+        aws_sdk_ssooidc::Client,
+        tokio::task::JoinHandle<serde_json::Value>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let response = response.to_string();
+        let error_type = error_type.to_string();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await.unwrap();
+            stream.write_all(format!(
+                "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-amzn-errortype: {error_type}\r\nConnection: close\r\n\r\n{response}", response.len()
+            ).as_bytes()).await.unwrap();
+            serde_json::from_slice(&body).unwrap()
+        });
+        let config = aws_sdk_ssooidc::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("ca-central-1"))
+            .endpoint_url(endpoint)
+            .retry_config(aws_sdk_ssooidc::config::retry::RetryConfig::disabled())
+            .build();
+        (aws_sdk_ssooidc::Client::from_conf(config), handle)
+    }
+
+    #[test]
+    fn silent_renewal_rotates_tokens_and_keeps_refresh_tokens_when_omitted() {
+        let broker = AwsBroker::new().unwrap();
+        broker.runtime.block_on(async {
+            for refresh in [None, Some("new-refresh")] {
+                let mut response =
+                    serde_json::json!({"accessToken": "new-access", "expiresIn": 3600});
+                if let Some(refresh) = refresh {
+                    response["refreshToken"] = refresh.into();
+                }
+                let (client, request) = mock_oidc(200, "", response).await;
+                let mut settings = session_settings();
+                renew_access_token(&client, &mut settings).await.unwrap();
+                let request = request.await.unwrap();
+                assert_eq!(request["grantType"], "refresh_token");
+                assert_eq!(request["refreshToken"], "old-refresh");
+                let token = settings.token.as_ref().unwrap();
+                assert_eq!(token.access_token, "new-access");
+                assert_eq!(token.refresh_token, refresh.unwrap_or("old-refresh"));
+                assert!(token.access_token_expires_at > now_seconds() + 3_500);
+            }
+        });
+    }
+
+    #[test]
+    fn only_rejected_sessions_require_login_and_transient_failures_preserve_tokens() {
+        let broker = AwsBroker::new().unwrap();
+        broker.runtime.block_on(async {
+            for (status, kind, expired) in [
+                (400, "InvalidGrantException", true),
+                (400, "ExpiredTokenException", true),
+                (401, "InvalidClientException", true),
+                (400, "UnauthorizedClientException", true),
+                (500, "InternalServerException", false),
+                (400, "SlowDownException", false),
+                (400, "InvalidRequestException", true),
+                (403, "AccessDeniedException", false),
+            ] {
+                let (client, request) =
+                    mock_oidc(status, kind, serde_json::json!({"message": "test error"})).await;
+                let mut settings = session_settings();
+                let error = renew_access_token(&client, &mut settings)
+                    .await
+                    .unwrap_err();
+                request.await.unwrap();
+                assert_eq!(is_session_expired_error(&error), expired, "{kind}: {error}");
+                if expired {
+                    assert!(settings.token.is_none());
+                } else {
+                    let token = settings.token.as_ref().unwrap();
+                    assert_eq!(token.access_token, "old-access");
+                    assert_eq!(token.refresh_token, "old-refresh");
+                    assert!(!error.contains("SdkBody"));
+                    assert!(!error.contains("raw:"));
+                }
+                assert_eq!(
+                    settings.registration.is_none(),
+                    matches!(
+                        kind,
+                        "InvalidClientException"
+                            | "UnauthorizedClientException"
+                            | "InvalidRequestException"
+                    )
+                );
+            }
+            let error: SdkError<CreateTokenError, ()> = SdkError::timeout_error(
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "test timeout"),
+            );
+            let message = refresh_token_error(&error);
+            assert!(!is_session_expired_error(&message));
+            assert!(message.contains("test timeout"));
+        });
+    }
+
+    #[test]
+    fn generic_invalid_request_starts_a_fresh_session_without_retrying_the_rejected_token() {
+        let broker = AwsBroker::new().unwrap();
+        broker.runtime.block_on(async {
+            let (client, request) = mock_oidc(
+                400,
+                "InvalidRequestException:http://internal.amazon.com/coral/com.amazonaws.sso.oidc/",
+                serde_json::json!({
+                    "error": "invalid_request", "error_description": "Invalid request",
+                    "location": null, "reason": null
+                }),
+            )
+            .await;
+            let mut settings = session_settings();
+            let error = renew_access_token(&client, &mut settings)
+                .await
+                .unwrap_err();
+            let request = request.await.unwrap();
+            assert_eq!(request["clientId"], "client");
+            assert_eq!(request["clientSecret"], "client-secret");
+            assert_eq!(request["grantType"], "refresh_token");
+            assert_eq!(request["refreshToken"], "old-refresh");
+            assert!(is_session_expired_error(&error));
+            assert!(settings.token.is_none());
+            assert!(settings.registration.is_none());
+
+            // The mock endpoint is closed. Re-entering the login path must request
+            // browser authorization immediately, without another rejected refresh.
+            assert!(is_session_expired_error(
+                &renew_access_token(&client, &mut settings)
+                    .await
+                    .unwrap_err()
+            ));
+
+            let (client, request) = mock_oidc(
+                200,
+                "",
+                serde_json::json!({
+                    "clientId": "fresh-client", "clientSecret": "fresh-secret",
+                    "clientSecretExpiresAt": now_seconds() + 3_600
+                }),
+            )
+            .await;
+            ensure_registration(&client, &mut settings).await.unwrap();
+            let request = request.await.unwrap();
+            assert_eq!(
+                request["grantTypes"],
+                serde_json::json!(["authorization_code", "refresh_token"])
+            );
+            assert_eq!(
+                settings.registration.as_ref().unwrap().client_id,
+                "fresh-client"
+            );
+        });
+    }
+
+    #[test]
+    fn invalid_request_with_a_configuration_reason_does_not_start_browser_login() {
+        let broker = AwsBroker::new().unwrap();
+        broker.runtime.block_on(async {
+            let (client, request) = mock_oidc(
+                400,
+                "InvalidRequestException",
+                serde_json::json!({
+                    "error": "invalid_request", "reason": "KMS_InvalidStateException",
+                    "message": "The configured encryption key is unavailable"
+                }),
+            )
+            .await;
+            let mut settings = session_settings();
+            let error = renew_access_token(&client, &mut settings)
+                .await
+                .unwrap_err();
+            request.await.unwrap();
+            assert!(!is_session_expired_error(&error));
+            assert!(error.contains("The configured encryption key is unavailable"));
+            assert!(!error.contains("raw:"));
+            assert_eq!(
+                settings.token.as_ref().unwrap().refresh_token,
+                "old-refresh"
+            );
+            assert!(settings.registration.is_some());
+        });
+    }
+
+    #[test]
+    fn user_facing_aws_errors_omit_raw_http_responses() {
+        let error = CreateTokenError::InvalidRequestException(
+            aws_sdk_ssooidc::types::error::InvalidRequestException::builder().build(),
+        );
+        let error = SdkError::service_error(error, "private HTTP response body");
+        assert_eq!(
+            aws_error_message(&error),
+            "service error: InvalidRequestException"
+        );
+    }
+
+    #[test]
+    fn browser_registration_upgrades_legacy_clients_and_reuses_the_registered_callback() {
+        let broker = AwsBroker::new().unwrap();
+        broker.runtime.block_on(async {
+            let mut settings = session_settings();
+            let (client, request) = mock_oidc(
+                200,
+                "",
+                serde_json::json!({
+                    "clientId": "browser-client", "clientSecret": "new-secret",
+                    "clientSecretExpiresAt": now_seconds() + 3_600,
+                    "authorizationEndpoint": "https://oidc.ca-central-1.amazonaws.com/authorize"
+                }),
+            )
+            .await;
+            ensure_registration(&client, &mut settings).await.unwrap();
+            let request = request.await.unwrap();
+            assert_eq!(
+                request["grantTypes"],
+                serde_json::json!(["authorization_code", "refresh_token"])
+            );
+            assert_eq!(request["redirectUris"], serde_json::json!([REDIRECT_URI]));
+            assert_eq!(request["issuerUrl"], settings.start_url);
+            assert!(settings.token.is_none());
+            // The mock listener has closed. A cached registration needs no network request.
+            ensure_registration(&client, &mut settings).await.unwrap();
+            assert_eq!(
+                settings.registration.as_ref().unwrap().client_id,
+                "browser-client"
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_registration_deserializes_and_valid_access_tokens_need_no_renewal() {
+        let registration: AwsOidcRegistration = serde_json::from_value(serde_json::json!({
+            "clientId": "legacy", "clientSecret": "secret", "clientSecretExpiresAt": 123
+        }))
+        .unwrap();
+        assert!(registration.authorization_endpoint.is_empty());
+        let broker = AwsBroker::new().unwrap();
+        let mut settings = session_settings();
+        settings.registration = None;
+        settings.token.as_mut().unwrap().access_token_expires_at = now_seconds() + 3_600;
+        broker
+            .runtime
+            .block_on(refresh_access_token(&mut settings))
+            .unwrap();
+        assert_eq!(settings.token.as_ref().unwrap().access_token, "old-access");
     }
 
     #[test]
