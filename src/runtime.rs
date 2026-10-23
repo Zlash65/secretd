@@ -290,6 +290,7 @@ fn open_request(cx: &mut App) {
     );
     let options = WindowOptions {
         kind: WindowKind::PopUp,
+        focus: false,
         titlebar: Some(TitleBar::title_bar_options()),
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(560.), px(460.))),
@@ -306,8 +307,6 @@ fn open_request(cx: &mut App) {
             let windows = cx.global_mut::<Windows>();
             windows.request = Some(handle);
             windows.request_view = view_entity.map(|view| view.downgrade());
-            cx.activate(true);
-            let _ = handle.update(cx, |_, window, _| window.activate_window());
         }
         Err(error) => eprintln!("Could not open secretd access request: {error}"),
     }
